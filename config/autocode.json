@@ -1,0 +1,37 @@
+{
+  "port": 4600,
+  "host": "iface:ztr2qyco3w",
+  "dataDir": "~/.local/share/autocode",
+  "worktreeRoot": "~/.local/share/autocode/worktrees",
+  "models": {
+    "planner": "opus",
+    "implementer": "sonnet"
+  },
+  "budgets": {
+    "plannerMaxTurns": 100,
+    "plannerMaxBudgetUsd": 12,
+    "implementerMaxTurns": 200,
+    "implementerMaxBudgetUsd": 25
+  },
+  "approvals": {
+    "pendingTimeoutMs": 1800000
+  },
+  "setup": {
+    "defaultCommand": null,
+    "timeoutMs": 900000
+  },
+  "notify": {
+    "desktop": true,
+    "sse": true,
+    "webPush": true
+  },
+  "auth": {
+    "cookieName": "autocode_session",
+    "cookieSecure": "auto",
+    "sessionTtlHours": 720,
+    "maxFailedAttempts": 10,
+    "lockoutMinutes": 15,
+    "trustedOrigins": []
+  },
+  "trustProxy": "10.242.0.0/16"
+}

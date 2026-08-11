@@ -1,0 +1,54 @@
+[
+  {
+    "id": "hard-container-privileged",
+    "description": "Docker is flatly incompatible with the kernel sandbox (docs/SANDBOX-FINDINGS.md), so this whole category already runs unsandboxed — these argv-level checks are the ONLY containment for what a `docker run` command line itself can request. A container's own runtime network egress, once started, is NOT visible to this or any other regex-level check; that residual gap is documented, not silently assumed away.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0", "any": ["docker", "podman"] },
+      { "kind": "any", "of": [
+        { "kind": "hasFlag", "flags": ["--privileged"] },
+        { "kind": "argvRegex", "pattern": "^--network=host$" },
+        { "kind": "argvRegex", "pattern": "^--mount$" }
+      ]}
+    ]}
+  },
+  {
+    "id": "hard-container-root-mount",
+    "description": "A -v/--volume/--mount flag whose source is / or a sensitive host directory hands the container the whole filesystem.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0", "any": ["docker", "podman"] },
+      { "kind": "argvRegex", "pattern": "^(-v|--volume=)?/(:|$)|^type=bind,src=/(:|,|$)" }
+    ]}
+  },
+  {
+    "id": "container-commands",
+    "description": "Container lifecycle commands other than the hard-denied dangerous flag combinations above.",
+    "layer": "category",
+    "decision": "allow",
+    "sandboxOverride": true,
+    "when": { "kind": "any", "of": [
+      { "kind": "all", "of": [
+        { "kind": "argv0", "any": ["docker"] },
+        { "kind": "argvRegex", "index": 1, "pattern": "^compose$" },
+        { "kind": "argvRegex", "index": 2, "pattern": "^(up|down|logs|ps|build|stop|restart)$" }
+      ]},
+      { "kind": "all", "of": [
+        { "kind": "argv0", "any": ["docker", "podman"] },
+        { "kind": "argvRegex", "index": 1, "pattern": "^(run|build|ps|logs|stop|rm|start|restart|inspect|images)$" }
+      ]}
+    ]}
+  },
+  {
+    "id": "container-registry-actions-ask",
+    "description": "Pushing images or logging into a registry is a network-egress + credential action — ask, not auto-allow.",
+    "layer": "category",
+    "decision": "ask",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0", "any": ["docker", "podman"] },
+      { "kind": "argvRegex", "index": 1, "pattern": "^(push|login)$" }
+    ]}
+  }
+]

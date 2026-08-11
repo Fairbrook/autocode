@@ -1,0 +1,21 @@
+[
+  {
+    "id": "playwright",
+    "description": "Playwright test/browser automation — explicitly requested capability. Same sandbox-override reasoning as dev-servers: needs to reach a server started in an earlier tool call.",
+    "layer": "category",
+    "decision": "allow",
+    "sandboxOverride": true,
+    "when": { "kind": "any", "of": [
+      { "kind": "argv0", "any": ["playwright"] },
+      { "kind": "all", "of": [
+        { "kind": "argv0", "any": ["npx"] },
+        { "kind": "argvRegex", "index": 1, "pattern": "^playwright$" }
+      ]},
+      { "kind": "all", "of": [
+        { "kind": "argv0", "any": ["pnpm"] },
+        { "kind": "argvRegex", "index": 1, "pattern": "^exec$" },
+        { "kind": "argvRegex", "index": 2, "pattern": "^playwright$" }
+      ]}
+    ]}
+  }
+]

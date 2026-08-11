@@ -1,0 +1,25 @@
+[
+  {
+    "id": "dev-servers",
+    "description": "Dev server / long-running process commands. The kernel sandbox can't support 'start in background, curl it from a later call' (see docs/SANDBOX-FINDINGS.md), so these run with dangerouslyDisableSandbox injected by the engine — the harness filter (path/network argv checks) is the real gate for this category, not the kernel.",
+    "layer": "category",
+    "decision": "allow",
+    "sandboxOverride": true,
+    "when": { "kind": "any", "of": [
+      { "kind": "all", "of": [
+        { "kind": "argv0", "any": ["pnpm", "npm", "yarn"] },
+        { "kind": "argvRegex", "index": 1, "pattern": "^(dev|start)$" }
+      ]},
+      { "kind": "all", "of": [
+        { "kind": "argv0", "any": ["pnpm", "npm", "yarn"] },
+        { "kind": "argvRegex", "index": 1, "pattern": "^run$" },
+        { "kind": "argvRegex", "index": 2, "pattern": "^(dev|start)$" }
+      ]},
+      { "kind": "argv0", "any": ["vite", "next", "uvicorn", "flask", "nodemon", "air", "webpack-dev-server"] },
+      { "kind": "all", "of": [
+        { "kind": "argv0", "any": ["python", "python3"] },
+        { "kind": "argvRegex", "pattern": "^http\\.server$" }
+      ]}
+    ]}
+  }
+]

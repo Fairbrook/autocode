@@ -1,0 +1,22 @@
+[
+  {
+    "name": "vergil",
+    "repoPath": "~/Documents/projects/vergil/",
+    "setupCommand": "cd daemon && uv sync",
+    "allowedNetworkDomains": [
+      "localhost", "127.0.0.1",
+      "registry.npmjs.org", "npmjs.org",
+      "pypi.org", "files.pythonhosted.org"
+    ]
+  },
+  {
+    "name": "galleon",
+    "repoPath": "~/Documents/projects/galleon/",
+    "setupCommand": "pnpm install --frozen-lockfile",
+    "allowedNetworkDomains": [
+      "localhost", "127.0.0.1",
+      "registry.npmjs.org", "npmjs.org",
+      "pypi.org", "files.pythonhosted.org"
+    ]
+  }
+]

@@ -1,0 +1,20 @@
+[
+  {
+    "id": "write-tools-inside-worktree-allow",
+    "description": "Write/Edit/NotebookEdit calls that reach this point already passed the 00-hard-deny path-escape check — i.e. they're inside the worktree, scratch dir, or allowed .git area. Freely allowed: writing code is the whole point of the implementation agent.",
+    "layer": "category",
+    "decision": "allow",
+    "tools": ["Write", "Edit", "NotebookEdit"],
+    "isFallback": true,
+    "when": { "kind": "all", "of": [] }
+  },
+  {
+    "id": "fallthrough-bash-ask",
+    "description": "Any Bash segment not resolved by an earlier rule — surfaced to the human via canUseTool rather than silently allowed or blocked. `{kind: 'all', of: []}` is vacuously true (matches every segment), so this is the true catch-all.",
+    "layer": "category",
+    "decision": "ask",
+    "tools": ["Bash"],
+    "isFallback": true,
+    "when": { "kind": "all", "of": [] }
+  }
+]

@@ -1,0 +1,85 @@
+[
+  {
+    "id": "git-safe-subcommands",
+    "description": "git subcommands that only inspect history or operate on the worktree's own branch. force-push and out-of-tree scoping are hard-denied separately; plain `push`, `reset --hard`, and `clean` are deliberately NOT here — they fall through to `ask` so a human sees them, rather than being either auto-allowed or permanently blocked.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0", "any": ["git"] },
+      { "kind": "argv0Sub", "cmd": "git", "sub": [
+        "status", "log", "diff", "show", "branch", "rev-parse", "ls-files",
+        "blame", "describe", "add", "commit", "restore", "tag", "fsck",
+        "shortlog", "reflog", "cat-file"
+      ]}
+    ]}
+  },
+  {
+    "id": "git-safe-remote-readonly",
+    "description": "`git remote -v` / `git remote show` only list configured remotes, they don't contact the network.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0Sub", "cmd": "git", "sub": ["remote"] },
+      { "kind": "any", "of": [
+        { "kind": "hasFlag", "flags": ["-v"] },
+        { "kind": "argvRegex", "index": 1, "pattern": "^show$" }
+      ]}
+    ]}
+  },
+  {
+    "id": "git-safe-stash-list",
+    "description": "`git stash list` is read-only; other stash subcommands aren't covered here.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0Sub", "cmd": "git", "sub": ["stash"] },
+      { "kind": "argvRegex", "index": 1, "pattern": "^list$" }
+    ]}
+  },
+  {
+    "id": "git-safe-worktree-list",
+    "description": "`git worktree list` is read-only; worktree creation/removal is done by the harness itself, not the agent.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0Sub", "cmd": "git", "sub": ["worktree"] },
+      { "kind": "argvRegex", "index": 1, "pattern": "^list$" }
+    ]}
+  },
+  {
+    "id": "git-safe-new-branch",
+    "description": "Creating and switching to a new local branch is safe and expected.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "any", "of": [
+      { "kind": "all", "of": [
+        { "kind": "argv0Sub", "cmd": "git", "sub": ["checkout"] },
+        { "kind": "hasFlag", "flags": ["-b"] }
+      ]},
+      { "kind": "all", "of": [
+        { "kind": "argv0Sub", "cmd": "git", "sub": ["switch"] },
+        { "kind": "hasFlag", "flags": ["-c"] }
+      ]}
+    ]}
+  },
+  {
+    "id": "git-safe-config-read",
+    "description": "`git config --get`/`-l`/`--list` only reads config. Writes (e.g. `git config core.hooksPath ...`, which could redirect hook execution to an arbitrary path) deliberately are NOT allow-listed here — they fall to `ask`.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0Sub", "cmd": "git", "sub": ["config"] },
+      { "kind": "hasFlag", "flags": ["--get", "-l", "--list", "--get-all", "--get-regexp"] }
+    ]}
+  },
+  {
+    "id": "git-safe-tag-list",
+    "description": "`git tag -l` / `git tag --list` is read-only.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0Sub", "cmd": "git", "sub": ["tag"] },
+      { "kind": "hasFlag", "flags": ["-l", "--list"] }
+    ]}
+  }
+]

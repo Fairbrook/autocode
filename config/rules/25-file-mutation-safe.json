@@ -1,0 +1,25 @@
+[
+  {
+    "id": "file-mutation-commands",
+    "description": "Commands that mutate files (rm, mv, cp, tee, chmod, chown, mkdir, touch) — allowed broadly. The 00-hard-deny path-escape rule (evaluated first, since hard always wins) is what actually restricts these to targets inside the worktree/scratch dir; this rule only covers the case where containment already passed.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "argv0", "any": ["rm", "mv", "cp", "tee", "chmod", "chown", "mkdir", "touch", "ln"] }
+  },
+  {
+    "id": "sed-awk-inplace",
+    "description": "sed/awk -i is a write, not a read — same reasoning as file-mutation-commands above: 00-hard-deny's path-escape check is what restricts the actual target.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "any", "of": [
+      { "kind": "all", "of": [
+        { "kind": "argv0", "any": ["sed", "awk"] },
+        { "kind": "hasFlag", "flags": ["-i"] }
+      ]},
+      { "kind": "all", "of": [
+        { "kind": "argv0", "any": ["sed", "awk"] },
+        { "kind": "argvRegex", "pattern": "^-i" }
+      ]}
+    ]}
+  }
+]

@@ -1,0 +1,9 @@
+[
+  {
+    "id": "package-manager-commands",
+    "description": "Package manager commands, including install/add/ci — kernel-sandboxed, single call, same reasoning as build-test. Installs are allowed outright rather than `ask` because the real network boundary is the kernel sandbox's domain allowlist (project.allowedNetworkDomains, see config/projects.json), not a per-call human approval; the well-known registries these tools hit by default (npm/pnpm/yarn -> registry.npmjs.org, pip/uv -> pypi.org/files.pythonhosted.org) are baseline-trusted there. A plan can still propose additional domains for anything beyond the default registry.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "argv0", "any": ["pnpm", "npm", "npx", "yarn", "uv", "uvx", "pip", "pip3"] }
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "todowrite-allow",
+    "description": "TodoWrite mutates nothing but the agent's own task list, which the harness mirrors into the UI as the run's progress view (see src/agent/todos.ts). Allowed unconditionally: gating it behind a human approval would stall the run on the one tool whose entire purpose is telling the human what's happening. Routed through the filter engine (rather than a bare `allowedTools` entry) so the decision still lands in tool_events like every other tool call.",
+    "layer": "category",
+    "decision": "allow",
+    "tools": ["TodoWrite"],
+    "when": { "kind": "all", "of": [] }
+  }
+]

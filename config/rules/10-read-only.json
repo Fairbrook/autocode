@@ -1,0 +1,27 @@
+[
+  {
+    "id": "read-only-commands",
+    "description": "Commands that cannot mutate state, always allowed.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "argv0", "any": [
+      "cat", "head", "tail", "less", "more", "nl", "wc", "sort", "uniq", "cut", "tr",
+      "grep", "egrep", "fgrep", "rg", "find", "fd", "ls", "tree", "stat", "file",
+      "du", "df", "realpath", "readlink", "dirname", "basename", "which", "type", "whoami",
+      "echo", "printf", "pwd", "date", "env", "printenv", "jq", "yq", "column",
+      "diff", "comm", "test", "true", "false", "sleep", "id", "uname", "hostname",
+      "md5sum", "sha1sum", "sha256sum", "xxd", "od", "cksum"
+    ]}
+  },
+  {
+    "id": "read-only-sed-without-inplace",
+    "description": "sed is read-only (prints to stdout) unless -i is present — the -i case is a write and is handled by the hard-deny path-escape rule instead.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0", "any": ["sed", "awk"] },
+      { "kind": "not", "of": { "kind": "hasFlag", "flags": ["-i"] } },
+      { "kind": "not", "of": { "kind": "argvRegex", "pattern": "^-i" } }
+    ]}
+  }
+]

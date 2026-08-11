@@ -1,0 +1,103 @@
+[
+  {
+    "id": "hard-sandbox-escape-flag",
+    "description": "The model requested dangerouslyDisableSandbox itself. Only the filter engine may set this flag (for the dev-server/playwright/container category); a model-originated request is always denied. Evaluated against the ORIGINAL tool input, before the engine's own sandboxOverride injection.",
+    "layer": "hard",
+    "decision": "deny",
+    "tools": ["Bash"],
+    "when": { "kind": "inputField", "path": "dangerouslyDisableSandbox", "exists": true }
+  },
+  {
+    "id": "hard-privilege-escalation",
+    "description": "sudo/doas/su/pkexec — privilege escalation off the table entirely.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "argv0", "any": ["sudo", "doas", "su", "pkexec"] }
+  },
+  {
+    "id": "hard-filesystem-destruction",
+    "description": "Tools that can destroy or reformat a filesystem outright.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "argv0", "any": ["mkfs", "mkfs.ext4", "mkfs.xfs", "mkfs.btrfs", "mkfs.vfat", "fdisk", "parted", "wipefs", "shred"] }
+  },
+  {
+    "id": "hard-dd-of",
+    "description": "dd with an of= target can overwrite raw devices or arbitrary files.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0", "any": ["dd"] },
+      { "kind": "argvRegex", "pattern": "^of=" }
+    ]}
+  },
+  {
+    "id": "hard-system-power-and-services",
+    "description": "System power state and service-manager control.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "argv0", "any": ["shutdown", "reboot", "halt", "poweroff", "systemctl", "service", "init"] }
+  },
+  {
+    "id": "hard-scheduling",
+    "description": "Persistent scheduled execution outside the session's own lifetime.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "argv0", "any": ["crontab", "at", "systemd-run", "batch"] }
+  },
+  {
+    "id": "hard-history-clear",
+    "description": "Clearing shell history is a cover-tracks action with no legitimate build/test purpose.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0", "any": ["history"] },
+      { "kind": "hasFlag", "flags": ["-c", "--clear"] }
+    ]}
+  },
+  {
+    "id": "hard-eval",
+    "description": "eval defeats static command analysis entirely — its argument can be anything.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "argv0", "any": ["eval", "exec"] }
+  },
+  {
+    "id": "hard-bare-interactive-shell",
+    "description": "A bare `sh`/`bash`/`zsh` invocation with no -c and no script file reads its command from stdin — the classic `curl ... | sh` shape, from any source feeding it, not just curl.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "rawRegex", "pattern": "^(sh|bash|zsh|dash|ksh)$" }
+  },
+  {
+    "id": "hard-git-scope-outside-worktree",
+    "description": "git -C / --git-dir / --work-tree can point git at a directory other than the worktree it was launched in.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0", "any": ["git"] },
+      { "kind": "any", "of": [
+        { "kind": "hasFlag", "flags": ["-C", "--git-dir", "--work-tree"] },
+        { "kind": "argvRegex", "pattern": "^--git-dir=|^--work-tree=" }
+      ]}
+    ]}
+  },
+  {
+    "id": "hard-git-force-push",
+    "description": "Force-pushing can silently discard remote history.",
+    "layer": "hard",
+    "decision": "deny",
+    "when": { "kind": "all", "of": [
+      { "kind": "argv0Sub", "cmd": "git", "sub": ["push"] },
+      { "kind": "hasFlag", "flags": ["-f", "--force", "--force-with-lease", "--force-if-includes"] }
+    ]}
+  },
+  {
+    "id": "hard-path-escape",
+    "description": "Generic containment check: any write-shaped target (Write/Edit/NotebookEdit file_path, or a Bash redirect/tee/cp/mv/sed-i/rm-recursive/chmod/curl-output target) that resolves outside the worktree, scratch dir, or allowed .git area — or inside an explicit deny carve-out such as .git/hooks — is denied. This single rule is what actually enforces \"stay inside the worktree,\" not an enumerated list of sensitive directories.",
+    "layer": "hard",
+    "decision": "deny",
+    "tools": ["Bash", "Write", "Edit", "NotebookEdit"],
+    "when": { "kind": "pathEscapes" }
+  }
+]

@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>autocode — sign in</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="login-main">
+    <form class="card login-card" id="login-form">
+      <h2>autocode</h2>
+      <label for="username">Username</label>
+      <input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required />
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required />
+      <div class="row" style="margin-top:1rem">
+        <button class="primary" type="submit" id="submit">Sign in</button>
+        <span class="error-text" id="login-error"></span>
+      </div>
+    </form>
+  </main>
+  <script type="module" src="/login.js"></script>
+</body>
+</html>

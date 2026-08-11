@@ -1,0 +1,13 @@
+[
+  {
+    "id": "build-test-tools",
+    "description": "Compilers, test runners, and linters. Safe to allow broadly even though e.g. `node -e \"...\"` / `python -c \"...\"` can run arbitrary interpreted code we can't statically inspect: unlike the dev-server/playwright/container category, these run as ONE self-contained Bash call, so the kernel sandbox (bubblewrap) stays ON and enforces filesystem/network containment on whatever the interpreter actually does, regardless of what this argv-level rule can see. See docs/SANDBOX-FINDINGS.md.",
+    "layer": "category",
+    "decision": "allow",
+    "when": { "kind": "argv0", "any": [
+      "node", "python", "python3", "py", "uv", "uvx", "pytest", "vitest", "jest", "go",
+      "cargo", "make", "cmake", "ninja", "tsc", "eslint", "prettier", "ruff",
+      "mypy", "black", "gofmt", "rustc", "javac", "mvn", "gradle"
+    ]}
+  }
+]
