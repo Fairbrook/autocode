@@ -8,41 +8,28 @@ import {
 
 /**
  * Tracks background work (backgrounded Bash commands — dev servers,
- * primarily — and backgrounded subagent launches) for one run, per
- * docs/SANDBOX-FINDINGS.md's confirmed mechanism:
+ * primarily — and backgrounded subagent launches) for one run:
  *
- *  - `TaskCreated`/`TaskCompleted` hooks fire on start/end with a
- *    human-readable subject/description, keyed by `task_id`.
  *  - `PostToolUse` on `Bash` carries `tool_response.backgroundTaskId` when
- *    a command was backgrounded — this is what ties a `task_id` back to
- *    the actual command string (the hooks alone don't distinguish a
- *    Bash-originated task from a subagent-originated one).
+ *    a command was backgrounded — this is what ties a task id back to the
+ *    actual command string.
  *  - The `system`/`background_tasks_changed` message on the main message
  *    stream (not a hook — see session-runner.ts) is the authoritative
  *    LEVEL signal for "what's running right now": REPLACE semantics, so
- *    reconcileLiveSet below treats its payload as the full current set,
- *    not an edge to pair against TaskCreated/TaskCompleted.
+ *    reconcileLiveSet below treats its payload as the full current set.
+ *
+ * NOT the `TaskCreated`/`TaskCompleted` hooks, which this used to consume.
+ * Those fire for the agent's own task list — the TaskCreate/TaskUpdate
+ * tools, i.e. the UI's progress feed — not for backgrounded processes.
+ * Wiring them here meant every todo item was recorded as a background task
+ * and then marked "leaked" at run end (run 12: 11 of 12), inflating
+ * background_leaked_count with work that was never a process. They belong
+ * to the task-list mirror in src/agent/todos.ts.
  */
 export function createBackgroundHooks(
   db: Db,
   runId: number
-): { taskCreated: HookCallback; taskCompleted: HookCallback; postToolUseBash: HookCallback } {
-  const taskCreated: HookCallback = async (input: HookInput) => {
-    if (input.hook_event_name !== "TaskCreated") return {};
-    upsertBackgroundTaskStarted(db, {
-      runId,
-      sdkTaskId: input.task_id,
-      description: input.task_subject,
-    });
-    return {};
-  };
-
-  const taskCompleted: HookCallback = async (input: HookInput) => {
-    if (input.hook_event_name !== "TaskCompleted") return {};
-    markBackgroundTaskStatus(db, runId, input.task_id, "completed");
-    return {};
-  };
-
+): { postToolUseBash: HookCallback } {
   const postToolUseBash: HookCallback = async (input: HookInput) => {
     if (input.hook_event_name !== "PostToolUse") return {};
     if (input.tool_name !== "Bash") return {};
@@ -62,7 +49,7 @@ export function createBackgroundHooks(
     return {};
   };
 
-  return { taskCreated, taskCompleted, postToolUseBash };
+  return { postToolUseBash };
 }
 
 /**

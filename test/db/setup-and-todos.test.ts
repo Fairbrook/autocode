@@ -59,9 +59,66 @@ describe("worktree setup persistence", () => {
         ruleProfile: null,
         allowedNetworkDomains: [],
         setupCommand: "uv sync",
+        allowDockerSocket: false,
+        localServiceHosts: [],
+        allowUnsandboxedCommands: false,
       },
     ]);
     expect(listProjects(db)[0]?.setup_command).toBe("uv sync");
+  });
+
+  it("keeps docker socket access off unless projects.json asks for it, and revokes it when the seed drops the flag", () => {
+    // Root-equivalent grant (see docs/SANDBOX-FINDINGS.md) — the default has
+    // to be off, and re-seeding has to be able to take it back, otherwise
+    // removing the line from projects.json would silently leave it enabled.
+    const project = createProject(db, { name: "demo", repoPath: "/tmp/demo-repo" });
+    expect(project.allow_docker_socket).toBe(0);
+
+    const seed = {
+      name: "demo",
+      repoPath: "/tmp/demo-repo",
+      defaultBaseRef: "HEAD",
+      ruleProfile: null,
+      allowedNetworkDomains: [],
+      setupCommand: null,
+      allowDockerSocket: true,
+      localServiceHosts: [],
+      allowUnsandboxedCommands: false,
+    };
+    upsertProjectSeeds(db, [seed]);
+    expect(listProjects(db)[0]?.allow_docker_socket).toBe(1);
+
+    upsertProjectSeeds(db, [{ ...seed, allowDockerSocket: false }]);
+    expect(listProjects(db)[0]?.allow_docker_socket).toBe(0);
+  });
+
+  it("seeds and revokes the local-service and unsandboxed-command grants the same way", () => {
+    // Same reasoning as the docker socket: both drop enforcement (one changes
+    // loopback routing, the other takes build/test commands out of the kernel
+    // sandbox entirely — see the 006 migration), so deleting the line from
+    // projects.json has to take the grant back rather than leave a stale 1.
+    const project = createProject(db, { name: "demo", repoPath: "/tmp/demo-repo" });
+    expect(project.local_service_hosts).toBe("[]");
+    expect(project.allow_unsandboxed_commands).toBe(0);
+
+    const seed = {
+      name: "demo",
+      repoPath: "/tmp/demo-repo",
+      defaultBaseRef: "HEAD",
+      ruleProfile: null,
+      allowedNetworkDomains: [],
+      setupCommand: null,
+      allowDockerSocket: false,
+      localServiceHosts: ["127.0.0.1"],
+      allowUnsandboxedCommands: true,
+    };
+    upsertProjectSeeds(db, [seed]);
+    expect(listProjects(db)[0]?.local_service_hosts).toBe('["127.0.0.1"]');
+    expect(listProjects(db)[0]?.allow_unsandboxed_commands).toBe(1);
+
+    upsertProjectSeeds(db, [{ ...seed, localServiceHosts: [], allowUnsandboxedCommands: false }]);
+    expect(listProjects(db)[0]?.local_service_hosts).toBe("[]");
+    expect(listProjects(db)[0]?.allow_unsandboxed_commands).toBe(0);
   });
 
   it("defaults to 'skipped' and records the full setup lifecycle", () => {

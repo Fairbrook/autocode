@@ -221,14 +221,34 @@ describe("filter engine — adversarial fixtures", () => {
     }
   });
 
-  it("allows pnpm dev with sandboxOverride, but not a plain pnpm run build", () => {
-    const dev = bash("pnpm dev");
-    expect(dev.decision).toBe("allow");
-    if (dev.decision === "allow") expect(dev.sandboxOverride).toBe(true);
+  it("marks package-manager and build/test commands sandboxOverride, git and read-only commands not", () => {
+    // sandboxOverride is a request, not a decision: the hook only acts on it
+    // for projects that set allowUnsandboxedCommands (006 migration), and it
+    // covers the package-manager category because `pnpm test` is how most
+    // projects invoke their runner — the escape hatch is unreachable
+    // otherwise. Anything that never needs to reach a host-local service
+    // stays kernel-sandboxed regardless of the project flag.
+    for (const cmd of ["pnpm dev", "pnpm run build", "pnpm test:rls", "vitest run", "pytest -q"]) {
+      const result = bash(cmd);
+      expect(result.decision, cmd).toBe("allow");
+      if (result.decision === "allow") expect(result.sandboxOverride, cmd).toBe(true);
+    }
 
-    const build = bash("pnpm run build");
-    expect(build.decision).toBe("allow");
-    if (build.decision === "allow") expect(build.sandboxOverride).toBe(false);
+    for (const cmd of ["git status", "ls -la", "cat README.md"]) {
+      const result = bash(cmd);
+      expect(result.decision, cmd).toBe("allow");
+      if (result.decision === "allow") expect(result.sandboxOverride, cmd).toBe(false);
+    }
+  });
+
+  it("auto-allows the agent's task-list tools, in both CLI shapes", () => {
+    // These are in FILTERED_TOOLS so the calls land in tool_events; if no rule
+    // matched them the engine would fail safe to `ask` and every run would
+    // stall on an approval prompt for its own progress feed.
+    for (const tool of ["TodoWrite", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList"]) {
+      const result = decide(shippedRules, ctx(tool, { subject: "step", taskId: "1" }));
+      expect(result.decision, tool).toBe("allow");
+    }
   });
 
   it("allows playwright with sandboxOverride", () => {

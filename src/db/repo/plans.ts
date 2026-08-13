@@ -50,6 +50,80 @@ export function createPlan(db: Db, input: PlanInput): PlanRow {
   return row;
 }
 
+export interface PlanRevisionInput {
+  summary: string;
+  taskCategory: string;
+  tddApplies: boolean;
+  tddRationale: string;
+  steps: { order: number; description: string }[];
+  proposedCommands: ProposedCommandJson[];
+  proposedDomains: ProposedDomainJson[];
+  risks: string[];
+  files: string[];
+  note?: string;
+}
+
+/**
+ * Writes a human-edited version of `base` and supersedes it, in one
+ * transaction so a task can never end up with two live plans.
+ *
+ * The new row keeps the original's `run_id`: the planning run is still where
+ * this plan came from, and there's no run of its own to point at. `source`
+ * and `supersedes_plan_id` are what distinguish it from what the model
+ * actually proposed. `raw_output_json` deliberately keeps the planner's
+ * original output rather than the edited values — it's the record of what
+ * the model said, and overwriting it would erase the only copy.
+ */
+export function createPlanRevision(
+  db: Db,
+  base: PlanRow,
+  input: PlanRevisionInput
+): PlanRow {
+  db.exec("BEGIN");
+  try {
+    const result = db
+      .prepare(
+        `INSERT INTO plans (
+          task_id, run_id, version, summary, task_category, tdd_applies, tdd_rationale,
+          steps_json, proposed_commands_json, proposed_domains_json, risks_json, files_json,
+          raw_output_json, status, source, edit_note, supersedes_plan_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'user_edit', ?, ?)`
+      )
+      .run(
+        base.task_id,
+        base.run_id,
+        base.version + 1,
+        input.summary,
+        input.taskCategory,
+        input.tddApplies ? 1 : 0,
+        input.tddRationale,
+        JSON.stringify(input.steps),
+        JSON.stringify(input.proposedCommands),
+        JSON.stringify(input.proposedDomains),
+        JSON.stringify(input.risks),
+        JSON.stringify(input.files),
+        base.raw_output_json,
+        input.note ?? null,
+        base.id
+      );
+    db.prepare("UPDATE plans SET status = 'superseded' WHERE id = ?").run(base.id);
+    db.exec("COMMIT");
+    const row = getPlan(db, Number(result.lastInsertRowid));
+    if (!row) throw new Error("failed to read back plan revision");
+    return row;
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}
+
+/** Every version of a task's plan, oldest first — the edit history. */
+export function listPlanVersions(db: Db, taskId: number): PlanRow[] {
+  return db
+    .prepare("SELECT * FROM plans WHERE task_id = ? ORDER BY version, id")
+    .all(taskId) as unknown as PlanRow[];
+}
+
 export function getPlan(db: Db, id: number): PlanRow | undefined {
   return db.prepare("SELECT * FROM plans WHERE id = ?").get(id) as
     | PlanRow

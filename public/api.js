@@ -36,6 +36,8 @@ export const api = {
   createTask: (body) => request("POST", "/api/tasks", body),
 
   getPlan: (id) => request("GET", `/api/plans/${id}`),
+  revisePlan: (id, plan) => request("POST", `/api/plans/${id}/revise`, plan),
+  listPlanVersions: (taskId) => request("GET", `/api/tasks/${taskId}/plans`),
   approvePlan: (id, body) => request("POST", `/api/plans/${id}/approve`, body),
   rejectPlan: (id) => request("POST", `/api/plans/${id}/reject`),
   implementPlan: (id) => request("POST", `/api/plans/${id}/implement`),

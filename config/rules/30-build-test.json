@@ -1,9 +1,10 @@
 [
   {
     "id": "build-test-tools",
-    "description": "Compilers, test runners, and linters. Safe to allow broadly even though e.g. `node -e \"...\"` / `python -c \"...\"` can run arbitrary interpreted code we can't statically inspect: unlike the dev-server/playwright/container category, these run as ONE self-contained Bash call, so the kernel sandbox (bubblewrap) stays ON and enforces filesystem/network containment on whatever the interpreter actually does, regardless of what this argv-level rule can see. See docs/SANDBOX-FINDINGS.md.",
+    "description": "Compilers, test runners, and linters. Safe to allow broadly even though e.g. `node -e \"...\"` / `python -c \"...\"` can run arbitrary interpreted code we can't statically inspect: these run as ONE self-contained Bash call, so the kernel sandbox (bubblewrap) normally stays ON and enforces filesystem/network containment on whatever the interpreter actually does, regardless of what this argv-level rule can see. `sandboxOverride` is inert unless the project sets `allowUnsandboxedCommands` (see the 006 migration) — the escape hatch for a project whose tests must reach host-local services over raw TCP, which no amount of proxy routing can deliver. Turning it on for a project makes this category filter-only, which is exactly as wide as it sounds. See docs/SANDBOX-FINDINGS.md.",
     "layer": "category",
     "decision": "allow",
+    "sandboxOverride": true,
     "when": { "kind": "argv0", "any": [
       "node", "python", "python3", "py", "uv", "uvx", "pytest", "vitest", "jest", "go",
       "cargo", "make", "cmake", "ninja", "tsc", "eslint", "prettier", "ruff",

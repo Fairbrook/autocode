@@ -1,0 +1,14 @@
+-- Per-project opt-in for Unix socket access inside the sandbox, which is what
+-- `docker`/`podman` actually need: the CLI is a thin client that talks to the
+-- daemon over /var/run/docker.sock, and the sandbox blocks AF_UNIX connect()
+-- by default. Without this the container category in config/rules/70-containers.json
+-- is allowed by the filter and then fails at runtime with
+-- "permission denied while trying to connect to the docker API".
+--
+-- Off by default, and deliberately not settable through POST /api/projects:
+-- reaching the docker socket is equivalent to root on the host (a container
+-- can bind-mount any directory the daemon can see, and gets its own network
+-- namespace with unrestricted egress that no regex-level filter can inspect).
+-- Granting it should require write access to the operator's config/projects.json,
+-- not just an authenticated session. See docs/SANDBOX-FINDINGS.md.
+ALTER TABLE projects ADD COLUMN allow_docker_socket INTEGER NOT NULL DEFAULT 0;

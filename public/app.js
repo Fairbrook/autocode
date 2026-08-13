@@ -237,24 +237,56 @@ async function renderTask(taskId) {
 }
 
 function renderPlanReview(plan) {
-  const steps = JSON.parse(plan.steps_json);
+  const steps = JSON.parse(plan.steps_json).sort((a, b) => a.order - b.order);
   const commands = JSON.parse(plan.proposed_commands_json);
   const domains = JSON.parse(plan.proposed_domains_json);
   const risks = JSON.parse(plan.risks_json || "[]");
+  const files = JSON.parse(plan.files_json || "[]");
 
   return `
     <div class="card">
-      <h2>Plan ready for review</h2>
-      <p>${esc(plan.summary)}</p>
-      <p><strong>Category:</strong> ${esc(plan.task_category)} &nbsp; <strong>TDD applies:</strong> ${plan.tdd_applies ? "yes" : "no"}</p>
-      <p class="muted">${esc(plan.tdd_rationale)}</p>
+      <div class="row between">
+        <h2 style="margin:0">Plan ready for review</h2>
+        <span class="muted">
+          v${plan.version}${plan.source === "user_edit" ? " · edited by you" : ""}
+          ${plan.version > 1 ? `· <a href="#" id="show-history">history</a>` : ""}
+        </span>
+      </div>
+      <p class="muted">Everything below is editable — change it here instead of asking for a new plan.</p>
+      <div id="plan-history" class="plan-history" hidden></div>
+
+      <label for="plan-summary">Summary</label>
+      <textarea id="plan-summary" rows="2">${esc(plan.summary)}</textarea>
+
+      <div class="plan-meta">
+        <div>
+          <label for="plan-category">Category</label>
+          <input id="plan-category" value="${esc(plan.task_category)}" />
+        </div>
+        <div>
+          <label for="plan-tdd">TDD applies</label>
+          <select id="plan-tdd">
+            <option value="yes" ${plan.tdd_applies ? "selected" : ""}>yes</option>
+            <option value="no" ${plan.tdd_applies ? "" : "selected"}>no</option>
+          </select>
+        </div>
+      </div>
+      <label for="plan-tdd-rationale">TDD rationale</label>
+      <input id="plan-tdd-rationale" value="${esc(plan.tdd_rationale)}" />
 
       <h3>Steps</h3>
-      <ol>${steps.sort((a, b) => a.order - b.order).map((s) => `<li>${esc(s.description)}</li>`).join("")}</ol>
+      <div id="steps-list">${steps.map((s) => stepRow(s.description)).join("")}</div>
+      <button id="add-step">+ Add step</button>
 
-      ${risks.length ? `<h3>Risks</h3><ul>${risks.map((r) => `<li class="muted">${esc(r)}</li>`).join("")}</ul>` : ""}
+      <h3>Risks</h3>
+      <div id="risks-list">${risks.map((r) => textRow(r, "risk", "Something that could go wrong")).join("")}</div>
+      <button id="add-risk">+ Add risk</button>
 
-      <h3>Proposed commands <span class="muted">(edit before approving)</span></h3>
+      <h3>Files expected to change</h3>
+      <div id="files-list">${files.map((f) => textRow(f, "file", "src/some/file.ts")).join("")}</div>
+      <button id="add-file">+ Add file</button>
+
+      <h3>Proposed commands</h3>
       <div id="commands-list">
         ${commands.map((c, i) => commandRow(c.pattern, c.category, i)).join("")}
       </div>
@@ -266,12 +298,34 @@ function renderPlanReview(plan) {
       </div>
       <button id="add-domain">+ Add domain</button>
 
+      <label for="plan-note">Note on your changes <span class="muted">(optional, passed to the agent)</span></label>
+      <input id="plan-note" placeholder="e.g. use the existing retry helper instead of adding one" />
+
       <div class="row" style="margin-top:1rem">
         <button class="primary" id="approve-plan">Approve &amp; continue</button>
+        <button id="save-plan">Save changes</button>
         <button class="danger" id="reject-plan">Reject</button>
+        <span class="muted" id="plan-status"></span>
       </div>
     </div>
   `;
+}
+
+function stepRow(description) {
+  return `<div class="step-row" data-row>
+    <span class="step-handle">⋮⋮</span>
+    <input value="${esc(description)}" data-step placeholder="What the agent should do" />
+    <button data-up title="Move up">↑</button>
+    <button data-down title="Move down">↓</button>
+    <button data-remove title="Remove">✕</button>
+  </div>`;
+}
+
+function textRow(value, kind, placeholder) {
+  return `<div class="text-row" data-row>
+    <input value="${esc(value)}" data-${kind} placeholder="${esc(placeholder)}" />
+    <button data-remove title="Remove">✕</button>
+  </div>`;
 }
 
 function commandRow(pattern, category, i) {
@@ -291,20 +345,110 @@ function domainRow(domain, i) {
 }
 
 function wirePlanReview(plan) {
+  const stepsList = document.getElementById("steps-list");
+  const risksList = document.getElementById("risks-list");
+  const filesList = document.getElementById("files-list");
   const commandsList = document.getElementById("commands-list");
   const domainsList = document.getElementById("domains-list");
+  const statusEl = document.getElementById("plan-status");
 
-  commandsList.addEventListener("click", (e) => {
-    if (e.target.matches("[data-remove]")) e.target.closest("[data-row]").remove();
+  // Every list behaves the same: ✕ removes a row, and steps also reorder.
+  for (const list of [stepsList, risksList, filesList, commandsList, domainsList]) {
+    list.addEventListener("click", (e) => {
+      const row = e.target.closest("[data-row]");
+      if (!row) return;
+      if (e.target.matches("[data-remove]")) row.remove();
+      if (e.target.matches("[data-up]") && row.previousElementSibling) {
+        row.parentNode.insertBefore(row, row.previousElementSibling);
+      }
+      if (e.target.matches("[data-down]") && row.nextElementSibling) {
+        row.parentNode.insertBefore(row.nextElementSibling, row);
+      }
+    });
+  }
+
+  const addTo = (list, html, focus) => {
+    list.insertAdjacentHTML("beforeend", html);
+    if (focus) list.lastElementChild.querySelector("input")?.focus();
+  };
+  document.getElementById("add-step").addEventListener("click", () => addTo(stepsList, stepRow(""), true));
+  document.getElementById("add-risk").addEventListener("click", () => addTo(risksList, textRow("", "risk", "Something that could go wrong"), true));
+  document.getElementById("add-file").addEventListener("click", () => addTo(filesList, textRow("", "file", "src/some/file.ts"), true));
+  document.getElementById("add-command").addEventListener("click", () => addTo(commandsList, commandRow("", "user_added"), true));
+  document.getElementById("add-domain").addEventListener("click", () => addTo(domainsList, domainRow(""), true));
+
+  document.getElementById("show-history")?.addEventListener("click", async (e) => {
+    e.preventDefault();
+    const box = document.getElementById("plan-history");
+    box.hidden = !box.hidden;
+    if (box.hidden || box.dataset.loaded) return;
+    const versions = await api.listPlanVersions(plan.task_id);
+    box.innerHTML = versions
+      .map((v) => `
+        <div class="plan-history-entry">
+          <strong>v${v.version}</strong>
+          <span class="muted">${v.source === "user_edit" ? "your edit" : "planning agent"} · ${esc(v.status)}</span>
+          ${v.edit_note ? `<div class="muted">“${esc(v.edit_note)}”</div>` : ""}
+          <ol>${JSON.parse(v.steps_json).sort((a, b) => a.order - b.order).map((s) => `<li class="muted">${esc(s.description)}</li>`).join("")}</ol>
+        </div>
+      `)
+      .join("");
+    box.dataset.loaded = "1";
   });
-  domainsList.addEventListener("click", (e) => {
-    if (e.target.matches("[data-remove]")) e.target.closest("[data-row]").remove();
-  });
-  document.getElementById("add-command").addEventListener("click", () => {
-    commandsList.insertAdjacentHTML("beforeend", commandRow("", "user_added"));
-  });
-  document.getElementById("add-domain").addEventListener("click", () => {
-    domainsList.insertAdjacentHTML("beforeend", domainRow(""));
+
+  /** The whole editable form, in the shape the revise/approve endpoints take. */
+  function collectPlanEdits() {
+    const values = (list, attr) =>
+      [...list.querySelectorAll(`[data-${attr}]`)].map((i) => i.value.trim()).filter(Boolean);
+    return {
+      summary: document.getElementById("plan-summary").value,
+      taskCategory: document.getElementById("plan-category").value,
+      tddApplies: document.getElementById("plan-tdd").value === "yes",
+      tddRationale: document.getElementById("plan-tdd-rationale").value,
+      steps: values(stepsList, "step"),
+      risks: values(risksList, "risk"),
+      files: values(filesList, "file"),
+      proposedCommands: [...commandsList.querySelectorAll("[data-row]")]
+        .map((row) => ({
+          pattern: row.querySelector("[data-pattern]").value.trim(),
+          category: row.querySelector("[data-category]").value.trim(),
+        }))
+        .filter((c) => c.pattern),
+      proposedDomains: [...domainsList.querySelectorAll("[data-row]")]
+        .map((row) => ({ domain: row.querySelector("[data-domain]").value.trim() }))
+        .filter((d) => d.domain),
+      note: document.getElementById("plan-note").value,
+    };
+  }
+
+  /** The approved-command/domain lists, which are separate from the plan text. */
+  function collectApprovals() {
+    return {
+      commands: [...commandsList.querySelectorAll("[data-row]")]
+        .map((row) => ({
+          pattern: row.querySelector("[data-pattern]").value.trim(),
+          category: row.querySelector("[data-category]").value.trim() || undefined,
+          origin: "proposed",
+        }))
+        .filter((c) => c.pattern),
+      domains: [...domainsList.querySelectorAll("[data-row]")]
+        .map((row) => ({ domain: row.querySelector("[data-domain]").value.trim(), origin: "proposed" }))
+        .filter((d) => d.domain),
+    };
+  }
+
+  document.getElementById("save-plan").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    statusEl.textContent = "Saving…";
+    try {
+      const { changed } = await api.revisePlan(plan.id, collectPlanEdits());
+      statusEl.textContent = changed ? "Saved as a new version." : "No changes to save.";
+      if (changed) setTimeout(() => renderTask(plan.task_id), 400);
+    } catch (err) {
+      statusEl.textContent = err.message;
+    } finally {
+      e.target.disabled = false;
+    }
   });
 
   document.getElementById("reject-plan").addEventListener("click", async () => {
@@ -315,21 +459,15 @@ function wirePlanReview(plan) {
 
   document.getElementById("approve-plan").addEventListener("click", async (e) => {
     e.target.disabled = true;
-    const commands = [...commandsList.querySelectorAll("[data-row]")].map((row) => ({
-      pattern: row.querySelector("[data-pattern]").value.trim(),
-      category: row.querySelector("[data-category]").value.trim() || undefined,
-      origin: "proposed",
-    })).filter((c) => c.pattern);
-    const domains = [...domainsList.querySelectorAll("[data-row]")].map((row) => ({
-      domain: row.querySelector("[data-domain]").value.trim(),
-      origin: "proposed",
-    })).filter((d) => d.domain);
-
+    statusEl.textContent = "Approving…";
     try {
-      await api.approvePlan(plan.id, { commands, domains });
+      // Edits ride along with the approval, so the server saves the new
+      // version and approves that one — approving a stale version isn't
+      // representable.
+      await api.approvePlan(plan.id, { ...collectApprovals(), plan: collectPlanEdits() });
       router();
     } catch (err) {
-      alert(err.message);
+      statusEl.textContent = err.message;
       e.target.disabled = false;
     }
   });
@@ -371,7 +509,8 @@ function renderSetupCard(worktree, live) {
 }
 
 /**
- * The agent's own TodoWrite list — what it's doing right now, in its words.
+ * The agent's own task list (TaskCreate/TaskUpdate, or TodoWrite on older
+ * builds) — what it's doing right now, in its words.
  * Until the agent posts its first list the approved plan's steps stand in,
  * so the panel is never empty while the user waits.
  */

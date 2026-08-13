@@ -5,9 +5,9 @@ import { appendRunLog } from "../db/repo/log.ts";
 import { setRunStatus, setRunSdkSessionId } from "../db/repo/runs.ts";
 import { upsertMetrics } from "../db/repo/metrics.ts";
 import { upsertRunTodos } from "../db/repo/todos.ts";
-import type { RunPhase } from "../types.ts";
+import type { RunPhase, TodoItem } from "../types.ts";
 import { scrubbedEnv } from "./env.ts";
-import { extractTodosFromContent } from "./todos.ts";
+import { createTaskListTracker } from "./todos.ts";
 
 export interface SessionRunResult {
   ok: boolean;
@@ -62,6 +62,41 @@ export async function runSession(input: RunSessionInput): Promise<SessionRunResu
   setRunStatus(db, runId, "running");
   appendRunLog(db, runId, "status", { status: "running", phase });
 
+  // The agent's task list is mirrored here rather than by the caller because
+  // it takes two signals that arrive on two different channels — the
+  // TaskCreated/TaskCompleted hooks and the TaskUpdate tool call — and both
+  // phases want the same behavior. See src/agent/todos.ts.
+  const taskList = createTaskListTracker();
+  function publishTodos(todos: TodoItem[]): void {
+    upsertRunTodos(db, runId, todos);
+    appendRunLog(db, runId, "todos", { todos });
+  }
+  const taskListHooks: Options["hooks"] = {
+    TaskCreated: [
+      {
+        hooks: [
+          async (hookInput) => {
+            if (hookInput.hook_event_name !== "TaskCreated") return {};
+            publishTodos(taskList.onTaskCreated(hookInput));
+            return {};
+          },
+        ],
+      },
+    ],
+    TaskCompleted: [
+      {
+        hooks: [
+          async (hookInput) => {
+            if (hookInput.hook_event_name !== "TaskCompleted") return {};
+            publishTodos(taskList.onTaskCompleted(hookInput));
+            return {};
+          },
+        ],
+      },
+    ],
+  };
+  const hooks = mergeHooks(input.hooks, taskListHooks);
+
   const options: Options = {
     cwd: input.cwd,
     model: input.model,
@@ -72,7 +107,7 @@ export async function runSession(input: RunSessionInput): Promise<SessionRunResu
     ...(input.allowedTools !== undefined ? { allowedTools: input.allowedTools } : {}),
     ...(input.disallowedTools !== undefined ? { disallowedTools: input.disallowedTools } : {}),
     ...(input.outputFormat !== undefined ? { outputFormat: input.outputFormat } : {}),
-    ...(input.hooks !== undefined ? { hooks: input.hooks } : {}),
+    hooks,
     ...(input.canUseTool !== undefined ? { canUseTool: input.canUseTool } : {}),
     ...(input.sandbox !== undefined ? { sandbox: input.sandbox } : {}),
     settingSources: input.settingSources ?? [],
@@ -127,11 +162,8 @@ export async function runSession(input: RunSessionInput): Promise<SessionRunResu
       // The agent's own task list, mirrored into the DB + the SSE stream so
       // the UI can show what it's working on right now rather than making
       // the user infer it from a wall of tool calls.
-      const todos = extractTodosFromContent(message.message.content);
-      if (todos) {
-        upsertRunTodos(db, runId, todos);
-        appendRunLog(db, runId, "todos", { todos });
-      }
+      const todos = taskList.applyMessageContent(message.message.content);
+      if (todos) publishTodos(todos);
       return;
     }
 
@@ -173,6 +205,23 @@ export async function runSession(input: RunSessionInput): Promise<SessionRunResu
   appendRunLog(db, runId, "status", { status: ok ? "completed" : "failed", error: errorSummary });
 
   return { ok, sessionId, structuredOutput, resultText, errorSummary };
+}
+
+/**
+ * Union of two hook maps, per event. The caller's matchers run first; ours
+ * are appended rather than replacing them, so registering a TaskCreated hook
+ * of your own doesn't silently switch off the task-list mirror.
+ */
+function mergeHooks(callerHooks: Options["hooks"], ownHooks: Options["hooks"]): Options["hooks"] {
+  const merged: Record<string, unknown[]> = {};
+  for (const source of [callerHooks, ownHooks]) {
+    if (!source) continue;
+    for (const [event, matchers] of Object.entries(source)) {
+      if (!matchers) continue;
+      merged[event] = [...(merged[event] ?? []), ...matchers];
+    }
+  }
+  return merged as Options["hooks"];
 }
 
 function summarizeError(message: SDKMessage): string {

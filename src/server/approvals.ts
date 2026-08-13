@@ -8,6 +8,7 @@ import {
 import { appendRunLog } from "../db/repo/log.ts";
 import type { RememberScope } from "../types.ts";
 import type { Fanout } from "../notify/index.ts";
+import { withLocalServiceProxyEnv } from "../filter/proxy-env.ts";
 
 interface PendingResolution {
   decision: "allow" | "deny";
@@ -38,6 +39,14 @@ export interface CreateCanUseToolInput {
   runId: number;
   pendingTimeoutMs: number;
   fanout: Fanout;
+  /**
+   * Hosts this project's dev services listen on. A command that reaches the
+   * human-in-the-loop path needs the same NO_PROXY narrowing an auto-allowed
+   * one gets from the filter hook (src/filter/proxy-env.ts) — without it,
+   * approving a test command would still leave it unable to connect. Applied
+   * after the decision, so the user approves the command they actually wrote.
+   */
+  localServiceHosts?: string[];
 }
 
 /**
@@ -47,6 +56,7 @@ export interface CreateCanUseToolInput {
  */
 export function createLiveCanUseTool(input: CreateCanUseToolInput): CanUseTool {
   const { db, runId, pendingTimeoutMs, fanout } = input;
+  const localServiceHosts = input.localServiceHosts ?? [];
 
   return async (toolName, toolInput, opts) => {
     const request = createApprovalRequest(db, {
@@ -93,7 +103,11 @@ export function createLiveCanUseTool(input: CreateCanUseToolInput): CanUseTool {
     appendRunLog(db, runId, "approval_resolved", { id: request.id, ...resolution });
 
     if (resolution.decision === "allow") {
-      return { behavior: "allow" };
+      const updatedInput =
+        toolName === "Bash"
+          ? withLocalServiceProxyEnv(toolInput as Record<string, unknown>, localServiceHosts)
+          : undefined;
+      return updatedInput ? { behavior: "allow", updatedInput } : { behavior: "allow" };
     }
     return { behavior: "deny", message: resolution.note ?? "Denied by user" };
   };

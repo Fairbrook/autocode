@@ -20,6 +20,8 @@ export type RunStatus =
   | "interrupted";
 
 export type PlanStatus = "pending" | "approved" | "rejected" | "superseded";
+/** Whether this plan version came from the planning agent or from a human editing it. */
+export type PlanSource = "planner" | "user_edit";
 export type WorktreeStatus = "active" | "retained" | "removed";
 /** 'skipped' = no setup command was configured for this project at all. */
 export type WorktreeSetupStatus =
@@ -40,6 +42,26 @@ export interface ProjectRow {
   allowed_network_domains: string; // JSON string[]
   /** Shell line run once in every new worktree; null falls back to config.setup.defaultCommand. */
   setup_command: string | null;
+  /**
+   * 1 lifts the sandbox's Unix-socket block so `docker`/`podman` can reach the
+   * daemon. Root-equivalent — see the 005 migration and docs/SANDBOX-FINDINGS.md.
+   * Settable only from config/projects.json, never over the HTTP API.
+   */
+  allow_docker_socket: number;
+  /**
+   * JSON string[] of hosts whose traffic should go through the sandbox proxy
+   * instead of being attempted directly (which cannot work — the sandbox
+   * netns has no routes). Merged into the run's allowed domains. See the 006
+   * migration and src/filter/proxy-env.ts.
+   */
+  local_service_hosts: string;
+  /**
+   * 1 makes the filter engine's `sandboxOverride` rules effective, i.e.
+   * build/test, dev-server, playwright and container commands run outside the
+   * kernel sandbox with the harness filter as the only boundary. See the 006
+   * migration and docs/SANDBOX-FINDINGS.md. config/projects.json only.
+   */
+  allow_unsandboxed_commands: number;
   enabled: number;
   created_at: string;
 }
@@ -103,6 +125,11 @@ export interface PlanRow {
   status: PlanStatus;
   approved_at: string | null;
   approval_note: string | null;
+  source: PlanSource;
+  /** Why the human changed it, if they said. */
+  edit_note: string | null;
+  /** The version this one replaced; null for the planner's original. */
+  supersedes_plan_id: number | null;
 }
 
 export interface WorktreeRow {

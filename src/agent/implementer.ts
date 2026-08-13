@@ -77,13 +77,22 @@ export async function runImplementer(input: RunImplementerInput): Promise<Implem
   const denyWriteRoots = [path.join(gitDir, "hooks"), path.join(gitDir, "config")];
   const projectDomains = JSON.parse(project.allowed_network_domains) as string[];
   const planDomains = listApprovedNetworkDomains(db, plan.id);
-  const allowedDomains = [...new Set([...projectDomains, ...planDomains])];
+  const localServiceHosts = JSON.parse(project.local_service_hosts || "[]") as string[];
+  // Local service hosts are merged in rather than required separately: the
+  // sandbox proxy enforces this allowlist for a host-local target exactly as
+  // it does for an external domain (an undeclared one gets a 403), so routing
+  // a host to the proxy without allowing it would only swap one connection
+  // failure for another. See src/filter/proxy-env.ts.
+  const allowedDomains = [...new Set([...projectDomains, ...planDomains, ...localServiceHosts])];
+  const allowUnsandboxedCommands = project.allow_unsandboxed_commands === 1;
 
   const filterHook = createFilterPreToolUseHook({
     getRules: () => allRules,
     getWriteRoots: () => writeRoots,
     getDenyWriteRoots: () => denyWriteRoots,
     getAllowedDomains: () => allowedDomains,
+    getLocalServiceHosts: () => localServiceHosts,
+    getUnsandboxedCommandsAllowed: () => allowUnsandboxedCommands,
     onDecision: ({ toolName, toolUseId, result }) => {
       recordToolEvent(db, {
         runId: run.id,
@@ -119,21 +128,35 @@ export async function runImplementer(input: RunImplementerInput): Promise<Implem
     // harness's single decision path and out of the tool_events audit trail.
     disallowedTools: ["WebFetch", "WebSearch"],
     settingSources: ["project"],
+    // TaskCreated/TaskCompleted are deliberately absent: they carry the
+    // agent's task list, not background processes, and runSession registers
+    // its own handlers for them (src/agent/todos.ts).
     hooks: {
       PreToolUse: [{ hooks: [filterHook] }],
       PostToolUse: [{ matcher: "Bash", hooks: [bgHooks.postToolUseBash] }],
-      TaskCreated: [{ hooks: [bgHooks.taskCreated] }],
-      TaskCompleted: [{ hooks: [bgHooks.taskCompleted] }],
     } as Options["hooks"],
     canUseTool: input.canUseTool,
     sandbox: {
       enabled: true,
       failIfUnavailable: true,
-      allowUnsandboxedCommands: false,
+      // Per-project escape hatch. False (the default) makes the SDK ignore
+      // `dangerouslyDisableSandbox` entirely, so the filter engine's
+      // sandboxOverride rules stay inert and every command is kernel-sandboxed.
+      // True hands build/test, dev-server, playwright and container commands
+      // to the harness filter alone — the only way a project whose tests speak
+      // raw postgres (or run on Node < 24) can reach its own dev services.
+      // See the 006 migration and docs/SANDBOX-FINDINGS.md.
+      allowUnsandboxedCommands,
       network: {
         allowLocalBinding: true,
         allowedDomains,
         strictAllowlist: true,
+        // `docker`/`podman` are clients, not runtimes: everything they do goes
+        // over /var/run/docker.sock, and the sandbox blocks AF_UNIX connect()
+        // unless this is set. It is all-or-nothing on Linux (seccomp cannot
+        // filter sockets by path), so the grant is per-project and off by
+        // default — see docs/SANDBOX-FINDINGS.md for what it costs.
+        ...(project.allow_docker_socket ? { allowAllUnixSockets: true } : {}),
       },
       filesystem: {
         allowWrite: writeRoots,
@@ -167,6 +190,9 @@ function renderPlanForPrompt(plan: PlanRow): string {
     .sort((a, b) => a.order - b.order)
     .map((s) => `${s.order}. ${s.description}`)
     .join("\n");
+  const risks = JSON.parse(plan.risks_json || "[]") as string[];
+  const files = JSON.parse(plan.files_json || "[]") as string[];
+
   return [
     `**Summary:** ${plan.summary}`,
     `**Category:** ${plan.task_category}`,
@@ -174,5 +200,21 @@ function renderPlanForPrompt(plan: PlanRow): string {
     ``,
     `**Steps:**`,
     stepsText,
+    // Risks and files are editable in the review UI, so they have to reach
+    // the agent — an edit box whose contents go nowhere is worse than no
+    // edit box. The human's version of these is the authoritative one by
+    // the time a plan is approved.
+    ...(risks.length ? [``, `**Risks called out during review:**`, ...risks.map((r) => `- ${r}`)] : []),
+    ...(files.length
+      ? [``, `**Files expected to change:** ${files.join(", ")}`]
+      : []),
+    ...(plan.source === "user_edit"
+      ? [
+          ``,
+          `Note: this plan was edited by the user after the planning agent wrote it${
+            plan.edit_note ? ` — "${plan.edit_note}"` : ""
+          }. Where the edits and the original approach differ, the edits win.`,
+        ]
+      : []),
   ].join("\n");
 }

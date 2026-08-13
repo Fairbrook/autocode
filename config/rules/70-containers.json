@@ -1,7 +1,7 @@
 [
   {
     "id": "hard-container-privileged",
-    "description": "Docker is flatly incompatible with the kernel sandbox (docs/SANDBOX-FINDINGS.md), so this whole category already runs unsandboxed — these argv-level checks are the ONLY containment for what a `docker run` command line itself can request. A container's own runtime network egress, once started, is NOT visible to this or any other regex-level check; that residual gap is documented, not silently assumed away.",
+    "description": "Docker works fine inside the kernel sandbox once a project grants `allowDockerSocket` — the blocker was the AF_UNIX connect() to /var/run/docker.sock, not the sandbox as such (docs/SANDBOX-FINDINGS.md). But reaching the daemon is root-equivalent whether or not the calling command is sandboxed, so these argv-level checks are the ONLY containment for what a `docker run` command line itself can request. A container's own runtime network egress, once started, is NOT visible to this or any other regex-level check; that residual gap is documented, not silently assumed away.",
     "layer": "hard",
     "decision": "deny",
     "when": { "kind": "all", "of": [

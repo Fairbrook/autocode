@@ -108,6 +108,52 @@ export const ProjectSeedSchema = z.object({
    * as a devcontainer postCreateCommand.
    */
   setupCommand: z.string().nullable().default(null),
+  /**
+   * Lets sandboxed commands in this project's worktrees connect to Unix
+   * sockets, which is the one thing `docker`/`podman` need and don't get:
+   * the CLI talks to the daemon over /var/run/docker.sock, and the sandbox
+   * blocks AF_UNIX by default. Leave it off unless the project's build or
+   * tests genuinely need containers.
+   *
+   * On Linux this cannot be scoped to the docker socket alone — seccomp
+   * can't filter sockets by path, so the SDK only offers the all-or-nothing
+   * `network.allowAllUnixSockets`. Turning it on therefore un-blocks *every*
+   * Unix socket for this project's runs, and reaching the docker daemon is
+   * root-equivalent regardless: a container can bind-mount anything the
+   * daemon can see and gets unrestricted network egress the filter engine
+   * cannot inspect. Deliberately absent from POST /api/projects — see the
+   * 005 migration and docs/SANDBOX-FINDINGS.md.
+   */
+  allowDockerSocket: z.boolean().default(false),
+  /**
+   * Hosts this project's dev services listen on, e.g. ["127.0.0.1"] for a
+   * local `supabase start` stack. A sandboxed command cannot reach them
+   * directly at all — its network namespace has only `lo` and no routes —
+   * so the harness routes these hosts through the sandbox runtime's proxy
+   * instead (see src/filter/proxy-env.ts). They are merged into
+   * allowedNetworkDomains automatically, since the proxy enforces that
+   * allowlist for local targets exactly as it does for external ones.
+   *
+   * Only reaches clients that honor proxy env vars: curl, git, pnpm/npm, and
+   * Node 24+ (via NODE_USE_ENV_PROXY, which this sets). Raw-TCP clients like
+   * psql, and undici on Node < 24, ignore it — those need
+   * allowUnsandboxedCommands below.
+   */
+  localServiceHosts: z.array(z.string()).default([]),
+  /**
+   * Runs this project's build/test, dev-server, playwright and container
+   * commands *outside* the kernel sandbox, leaving the harness filter (argv
+   * allow-list, path-guard, network-guard) as the only boundary. Without it
+   * the SDK ignores `dangerouslyDisableSandbox` entirely, so the filter
+   * engine's `sandboxOverride` rules are inert.
+   *
+   * The escape hatch for projects whose tests genuinely cannot be reached by
+   * proxy routing — raw postgres/redis connections, Node < 24 — and a real
+   * reduction in enforcement, since no argv-level filter can see what
+   * `pytest` or `node -e` does once it is running. Off by default and, like
+   * allowDockerSocket, absent from POST /api/projects on purpose.
+   */
+  allowUnsandboxedCommands: z.boolean().default(false),
 });
 export type ProjectSeed = z.infer<typeof ProjectSeedSchema>;
 

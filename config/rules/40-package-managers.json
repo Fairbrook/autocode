@@ -1,9 +1,10 @@
 [
   {
     "id": "package-manager-commands",
-    "description": "Package manager commands, including install/add/ci — kernel-sandboxed, single call, same reasoning as build-test. Installs are allowed outright rather than `ask` because the real network boundary is the kernel sandbox's domain allowlist (project.allowedNetworkDomains, see config/projects.json), not a per-call human approval; the well-known registries these tools hit by default (npm/pnpm/yarn -> registry.npmjs.org, pip/uv -> pypi.org/files.pythonhosted.org) are baseline-trusted there. A plan can still propose additional domains for anything beyond the default registry.",
+    "description": "Package manager commands, including install/add/ci — kernel-sandboxed, single call, same reasoning as build-test. Installs are allowed outright rather than `ask` because the real network boundary is the kernel sandbox's domain allowlist (project.allowedNetworkDomains, see config/projects.json), not a per-call human approval; the well-known registries these tools hit by default (npm/pnpm/yarn -> registry.npmjs.org, pip/uv -> pypi.org/files.pythonhosted.org) are baseline-trusted there. A plan can still propose additional domains for anything beyond the default registry. `sandboxOverride` carries the same caveat as build-test and is inert unless the project sets `allowUnsandboxedCommands`: it is here because `pnpm test` / `npx vitest` is how most projects actually invoke their test runner, so overriding build-test alone would leave the escape hatch unreachable. It does mean an opted-in project's `pnpm install` runs unsandboxed too — which is already true of that project's setup command, which the operator writes and the harness runs unfiltered.",
     "layer": "category",
     "decision": "allow",
+    "sandboxOverride": true,
     "when": { "kind": "argv0", "any": ["pnpm", "npm", "npx", "yarn", "uv", "uvx", "pip", "pip3"] }
   }
 ]

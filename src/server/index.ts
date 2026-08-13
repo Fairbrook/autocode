@@ -3,11 +3,21 @@ import fastifyStatic from "@fastify/static";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expandHome, loadConfig, loadProjectSeeds, resolveBindHost } from "../config.ts";
-import { openDb } from "../db/index.ts";
+import { openDb, type Db } from "../db/index.ts";
+import type { PlanRow } from "../types.ts";
 import { upsertProjectSeeds, listProjects, createProject, getProject } from "../db/repo/projects.ts";
 import { createTask, getTask, listTasks, setTaskStatus } from "../db/repo/tasks.ts";
 import { listRuns, getRun, listRunsByStatus, setRunStatus, createRun } from "../db/repo/runs.ts";
-import { getPlan, getPlanForTask, setPlanStatus, addApprovedCommandRules, addApprovedNetworkDomains } from "../db/repo/plans.ts";
+import {
+  getPlan,
+  getPlanForTask,
+  setPlanStatus,
+  addApprovedCommandRules,
+  addApprovedNetworkDomains,
+  createPlanRevision,
+  listPlanVersions,
+} from "../db/repo/plans.ts";
+import { PlanEditSchema, applyPlanEdits } from "./plan-edit.ts";
 import {
   listWorktrees,
   getWorktree,
@@ -224,16 +234,77 @@ export async function buildServer(options: BuildServerOptions = {}) {
     return plan;
   });
 
+  /**
+   * Edit a generated plan instead of throwing it away and re-planning.
+   * Writes a new version and supersedes the old one; the response is the
+   * new plan, which is what the client then approves.
+   */
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/api/plans/:id/revise",
+    async (req, reply) => {
+      const plan = getPlan(db, Number(req.params.id));
+      if (!plan) return reply.code(404).send({ error: "plan not found" });
+
+      const guard = planIsEditable(db, plan);
+      if (!guard.ok) return reply.code(409).send({ error: guard.error });
+
+      const parsed = PlanEditSchema.safeParse(req.body ?? {});
+      if (!parsed.success) {
+        return reply.code(400).send({ error: `invalid plan edit: ${parsed.error.message}` });
+      }
+
+      const edited = applyPlanEdits(plan, parsed.data);
+      if (!edited.ok) return reply.code(400).send({ error: edited.error });
+      if (!edited.changed) return { plan, changed: false };
+
+      const revision = createPlanRevision(db, plan, edited.value);
+      // An edit after approval puts the task back in front of the human —
+      // what they approved is not what would now run.
+      if (plan.status === "approved") {
+        setTaskStatus(db, plan.task_id, "awaiting_approval");
+      }
+      app.log.info(
+        { taskId: plan.task_id, from: plan.id, to: revision.id, version: revision.version },
+        "plan revised"
+      );
+      reply.code(201);
+      return { plan: revision, changed: true };
+    }
+  );
+
+  app.get<{ Params: { id: string } }>("/api/tasks/:id/plans", async (req) =>
+    listPlanVersions(db, Number(req.params.id))
+  );
+
   app.post<{
     Params: { id: string };
     Body: {
       commands: { pattern: string; category?: string; note?: string; origin: "proposed" | "user_added" }[];
       domains: { domain: string; note?: string; origin: "proposed" | "user_added" }[];
       note?: string;
+      /**
+       * Optional edits to apply first. Lets the UI save-and-approve in one
+       * click, so an edited plan can never be approved as its pre-edit
+       * version through a lost race between two requests.
+       */
+      plan?: unknown;
     };
   }>("/api/plans/:id/approve", async (req, reply) => {
-    const plan = getPlan(db, Number(req.params.id));
+    let plan = getPlan(db, Number(req.params.id));
     if (!plan) return reply.code(404).send({ error: "plan not found" });
+
+    if (req.body.plan !== undefined) {
+      const guard = planIsEditable(db, plan);
+      if (!guard.ok) return reply.code(409).send({ error: guard.error });
+
+      const parsed = PlanEditSchema.safeParse(req.body.plan);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: `invalid plan edit: ${parsed.error.message}` });
+      }
+      const edited = applyPlanEdits(plan, parsed.data);
+      if (!edited.ok) return reply.code(400).send({ error: edited.error });
+      if (edited.changed) plan = createPlanRevision(db, plan, edited.value);
+    }
 
     addApprovedCommandRules(db, plan.id, req.body.commands);
     addApprovedNetworkDomains(db, plan.id, req.body.domains);
@@ -241,7 +312,7 @@ export async function buildServer(options: BuildServerOptions = {}) {
     setTaskStatus(db, plan.task_id, "approved");
 
     reply.code(200);
-    return { ok: true };
+    return { ok: true, planId: plan.id };
   });
 
   app.post<{ Params: { id: string } }>("/api/plans/:id/reject", async (req, reply) => {
@@ -302,6 +373,10 @@ export async function buildServer(options: BuildServerOptions = {}) {
       runId: run.id,
       pendingTimeoutMs: config.approvals.pendingTimeoutMs,
       fanout,
+      // Same NO_PROXY narrowing the filter hook applies to auto-allowed
+      // commands: a command the human approves has to be able to reach the
+      // project's dev services too.
+      localServiceHosts: JSON.parse(project.local_service_hosts || "[]") as string[],
     });
 
     // A project's own command wins; config.setup.defaultCommand is the
@@ -429,6 +504,26 @@ export async function buildServer(options: BuildServerOptions = {}) {
   });
 
   return { app, db, config, expiredApprovals };
+}
+
+/**
+ * A plan can be edited while it's still the live one and nothing has been
+ * built from it. Once an implementation run exists, the worktree and the
+ * agent's context were derived from the approved text, so editing it would
+ * describe work that isn't what's actually happening — retry the task
+ * instead.
+ */
+function planIsEditable(db: Db, plan: PlanRow): { ok: true } | { ok: false; error: string } {
+  if (plan.status === "superseded") {
+    return { ok: false, error: "this plan version was already replaced by a newer one" };
+  }
+  if (plan.status === "rejected") {
+    return { ok: false, error: "this plan was rejected" };
+  }
+  if (listRuns(db, plan.task_id).some((r) => r.phase === "implementation")) {
+    return { ok: false, error: "implementation has already started for this task" };
+  }
+  return { ok: true };
 }
 
 export async function startServer() {

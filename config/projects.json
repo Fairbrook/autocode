@@ -13,6 +13,9 @@
     "name": "galleon",
     "repoPath": "~/Documents/projects/galleon/",
     "setupCommand": "pnpm install --frozen-lockfile",
+    "allowDockerSocket": true,
+    "localServiceHosts": ["127.0.0.1"],
+    "allowUnsandboxedCommands": true,
     "allowedNetworkDomains": [
       "localhost", "127.0.0.1",
       "registry.npmjs.org", "npmjs.org",

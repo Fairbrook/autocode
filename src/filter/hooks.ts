@@ -1,5 +1,6 @@
 import type { HookCallback, HookInput, HookJSONOutput } from "@anthropic-ai/claude-agent-sdk";
 import { decide } from "./engine.ts";
+import { withLocalServiceProxyEnv } from "./proxy-env.ts";
 import type { FilterContext, FinalDecision } from "./types.ts";
 import type { Rule } from "./types.ts";
 
@@ -8,6 +9,21 @@ export interface FilterHookDeps {
   getWriteRoots: () => string[];
   getDenyWriteRoots: () => string[];
   getAllowedDomains: () => string[];
+  /**
+   * Hosts running services this project's commands need to reach (project
+   * `localServiceHosts`). Non-empty means allowed Bash commands get a
+   * NO_PROXY-narrowing prefix so those hosts route through the sandbox
+   * proxy — the only way a sandboxed call can reach them at all. Defaults to
+   * none, in which case commands are passed through untouched.
+   */
+  getLocalServiceHosts?: () => string[];
+  /**
+   * Whether this run was started with the SDK's `allowUnsandboxedCommands`.
+   * When false, `dangerouslyDisableSandbox` is ignored by the SDK anyway, so
+   * injecting it would only produce a misleading audit trail: the command
+   * would still run sandboxed. Defaults to false — see docs/SANDBOX-FINDINGS.md.
+   */
+  getUnsandboxedCommandsAllowed?: () => boolean;
   /** Called for every decision, before returning the hook output — this is the audit trail (tool_events table). */
   onDecision: (input: {
     toolName: string;
@@ -17,7 +33,21 @@ export interface FilterHookDeps {
   }) => void;
 }
 
-const FILTERED_TOOLS = new Set(["Bash", "Write", "Edit", "NotebookEdit", "TodoWrite"]);
+const FILTERED_TOOLS = new Set([
+  "Bash",
+  "Write",
+  "Edit",
+  "NotebookEdit",
+  // The agent's task list, in both the old and current CLI shapes. Allowed
+  // unconditionally by config/rules/15-agent-state.json, but routed through
+  // the engine so the calls still land in tool_events — before this, 25
+  // TaskCreate/TaskUpdate calls in run 12 left no audit trace at all.
+  "TodoWrite",
+  "TaskCreate",
+  "TaskUpdate",
+  "TaskGet",
+  "TaskList",
+]);
 
 /**
  * Builds the PreToolUse hook callback that wires the filter engine into the
@@ -74,16 +104,32 @@ export function createFilterPreToolUseHook(deps: FilterHookDeps): HookCallback {
     }
 
     // allow
-    if (toolName === "Bash" && result.sandboxOverride) {
-      const updatedInput = { ...toolInput, dangerouslyDisableSandbox: true };
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: "allow",
-          permissionDecisionReason: "Matched a dev-server/playwright/container rule — running outside the kernel sandbox; see docs/SANDBOX-FINDINGS.md.",
-          updatedInput,
-        },
-      };
+    if (toolName === "Bash") {
+      // Unsandboxing wins over proxy routing: outside the sandbox there is no
+      // proxy to route to, and the command reaches local services natively.
+      if (result.sandboxOverride && (deps.getUnsandboxedCommandsAllowed?.() ?? false)) {
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "allow",
+            permissionDecisionReason:
+              "Matched a sandboxOverride rule (build-test/dev-server/playwright/container) and this project sets allowUnsandboxedCommands — running outside the kernel sandbox; see docs/SANDBOX-FINDINGS.md.",
+            updatedInput: { ...toolInput, dangerouslyDisableSandbox: true },
+          },
+        };
+      }
+
+      const updatedInput = withLocalServiceProxyEnv(toolInput, deps.getLocalServiceHosts?.() ?? []);
+      if (updatedInput) {
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "allow",
+            permissionDecisionReason: result.matches.map((m) => m.rule.id).join(", ") || undefined,
+            updatedInput,
+          },
+        };
+      }
     }
 
     return {
