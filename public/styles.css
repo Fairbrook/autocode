@@ -91,6 +91,18 @@ table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 600; }
 
+/* ---- Task list filters ---- */
+.filter-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+@media (max-width: 560px) {
+  .filter-bar { grid-template-columns: minmax(0, 1fr); }
+}
+.filter-bar select { text-transform: capitalize; }
+
 .badge {
   display: inline-block;
   padding: 0.1rem 0.5rem;

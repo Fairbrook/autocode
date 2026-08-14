@@ -10,6 +10,17 @@
     ]
   },
   {
+    "name": "fairutils",
+    "repoPath": "~/Documents/projects/fairutils/",
+    "setupCommand": "pnpm i --frozen-lockfile && cd server && uv sync",
+    "allowUnsandboxedCommands": true,
+    "allowedNetworkDomains": [
+      "localhost", "127.0.0.1",
+      "registry.npmjs.org", "npmjs.org",
+      "pypi.org", "files.pythonhosted.org"
+    ]
+  },
+  {
     "name": "galleon",
     "repoPath": "~/Documents/projects/galleon/",
     "setupCommand": "pnpm install --frozen-lockfile",

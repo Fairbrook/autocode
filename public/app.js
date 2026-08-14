@@ -74,6 +74,13 @@ async function setupSession() {
 }
 
 // ---------- Home: project/task submit + task list ----------
+
+/** Canonical task lifecycle order, so the status filter reads as a progression. */
+const TASK_STATUSES = [
+  "draft", "planning", "awaiting_approval", "approved",
+  "setting_up", "implementing", "done", "failed", "cancelled",
+];
+
 async function renderHome() {
   // Worktrees come along so a finished-but-unmerged task is visible from the
   // list itself, without opening it. They arrive newest-first, so the first
@@ -83,6 +90,11 @@ async function renderHome() {
     api.listTasks(),
     api.listWorktrees(),
   ]);
+
+  const projectName = (id) => projects.find((p) => p.id === id)?.name ?? `project #${id}`;
+  // Only statuses that actually occur, so the dropdown can't offer a choice
+  // that filters everything away.
+  const presentStatuses = TASK_STATUSES.filter((s) => tasks.some((t) => t.status === s));
 
   app.innerHTML = `
     <div class="card">
@@ -112,21 +124,27 @@ async function renderHome() {
     <div class="card">
       <h2>Tasks</h2>
       ${tasks.length === 0 ? `<p class="muted">No tasks yet.</p>` : `
+        <div class="filter-bar">
+          <input id="task-search" type="search" placeholder="Search tasks…" aria-label="Search tasks" />
+          <select id="filter-project" aria-label="Filter by project">
+            <option value="">All projects</option>
+            ${projects.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join("")}
+          </select>
+          <select id="filter-status" aria-label="Filter by status">
+            <option value="">All statuses</option>
+            ${presentStatuses.map((s) => `<option value="${esc(s)}">${esc(s.replace(/_/g, " "))}</option>`).join("")}
+          </select>
+        </div>
         <table>
-          <thead><tr><th>Title</th><th>Status</th><th>Updated</th></tr></thead>
-          <tbody>
-            ${tasks.map((t) => `
-              <tr style="cursor:pointer" onclick="location.hash='#/tasks/${t.id}'">
-                <td>${esc(t.title)}</td>
-                <td>${badge(t.status)} ${unmergedBadge(t, worktrees.find((w) => w.task_id === t.id))}</td>
-                <td class="muted">${new Date(t.updated_at).toLocaleString()}</td>
-              </tr>
-            `).join("")}
-          </tbody>
+          <thead><tr><th>Title</th><th>Project</th><th>Status</th><th>Updated</th></tr></thead>
+          <tbody id="task-rows"></tbody>
         </table>
+        <p id="task-empty" class="muted" hidden>No tasks match these filters.</p>
       `}
     </div>
   `;
+
+  if (tasks.length > 0) setupTaskFilters({ tasks, worktrees, projectName });
 
   document.getElementById("project-select").addEventListener("change", (e) => {
     document.getElementById("new-project-fields").style.display = e.target.value === "__new__" ? "block" : "none";
@@ -160,6 +178,47 @@ async function renderHome() {
       status.textContent = err.message;
     }
   });
+}
+
+/**
+ * Filtering happens here rather than on the server: the list is small enough to
+ * hold in the page, and redrawing only the rows keeps whatever the user is
+ * typing (and its focus) intact between keystrokes.
+ */
+function setupTaskFilters({ tasks, worktrees, projectName }) {
+  const search = document.getElementById("task-search");
+  const project = document.getElementById("filter-project");
+  const status = document.getElementById("filter-status");
+  const rows = document.getElementById("task-rows");
+  const empty = document.getElementById("task-empty");
+
+  function draw() {
+    const q = search.value.trim().toLowerCase();
+    const visible = tasks.filter((t) => {
+      if (project.value && String(t.project_id) !== project.value) return false;
+      if (status.value && t.status !== status.value) return false;
+      if (!q) return true;
+      // The description isn't in the table, but it is what the user wrote, so
+      // searching it finds tasks whose title alone wouldn't match.
+      return [t.title, t.description, projectName(t.project_id)]
+        .some((field) => String(field ?? "").toLowerCase().includes(q));
+    });
+
+    rows.innerHTML = visible.map((t) => `
+      <tr style="cursor:pointer" onclick="location.hash='#/tasks/${t.id}'">
+        <td>${esc(t.title)}</td>
+        <td class="muted">${esc(projectName(t.project_id))}</td>
+        <td>${badge(t.status)} ${unmergedBadge(t, worktrees.find((w) => w.task_id === t.id))}</td>
+        <td class="muted">${new Date(t.updated_at).toLocaleString()}</td>
+      </tr>
+    `).join("");
+    empty.hidden = visible.length > 0;
+  }
+
+  search.addEventListener("input", draw);
+  project.addEventListener("change", draw);
+  status.addEventListener("change", draw);
+  draw();
 }
 
 // ---------- History ----------
