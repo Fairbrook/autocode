@@ -47,6 +47,9 @@ export const api = {
 
   listWorktrees: () => request("GET", "/api/worktrees"),
   getWorktreeDiff: (id) => request("GET", `/api/worktrees/${id}/diff`),
+  /** Per-file diff of the whole branch + whether it can be merged right now. */
+  getWorktreeChanges: (id) => request("GET", `/api/worktrees/${id}/changes`),
+  mergeWorktree: (id, body) => request("POST", `/api/worktrees/${id}/merge`, body),
   discardWorktree: (id) => request("POST", `/api/worktrees/${id}/discard`),
 
   listApprovals: (runId) => request("GET", `/api/approvals${runId ? `?runId=${runId}` : ""}`),

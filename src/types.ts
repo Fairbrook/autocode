@@ -151,6 +151,10 @@ export interface WorktreeRow {
   setup_ended_at: string | null;
   created_at: string;
   removed_at: string | null;
+  /** Set once the branch has been merged into the main checkout — see the 007 migration. */
+  merged_at: string | null;
+  merge_commit: string | null;
+  merge_target_branch: string | null;
 }
 
 export interface ApprovalRequestRow {

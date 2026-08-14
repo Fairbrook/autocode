@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { buildServer } from "../../src/server/index.ts";
@@ -9,7 +9,7 @@ import { createProject } from "../../src/db/repo/projects.ts";
 import { createTask, getTask } from "../../src/db/repo/tasks.ts";
 import { createRun, getRun } from "../../src/db/repo/runs.ts";
 import { createPlan, setPlanStatus } from "../../src/db/repo/plans.ts";
-import { listWorktrees } from "../../src/db/repo/worktrees.ts";
+import { getWorktree, listWorktrees } from "../../src/db/repo/worktrees.ts";
 import { listRunLog } from "../../src/db/repo/log.ts";
 import { loginAs } from "../helpers/auth.ts";
 import { writeTestConfig } from "../helpers/server.ts";
@@ -199,6 +199,53 @@ describe("POST /api/plans/:id/implement — worktree setup", () => {
     expect(run.error).toContain("setup command exited 9");
     // The whole point: the agent is never handed a half-installed worktree.
     expect(agentCalls).toHaveLength(0);
+  });
+
+  it("retries the same plan in a fresh worktree, discarding the one setup failed in", async () => {
+    // Fails until the marker file exists: the shape of a real retry, where
+    // the operator fixes the environment between the two attempts.
+    const fixed = path.join(base, "environment-fixed");
+    const project = createProject(db, {
+      name: "demo",
+      repoPath,
+      setupCommand: `test -f ${fixed}`,
+    });
+    const { task, plan } = approvedPlanFor(project);
+
+    await server.app.inject({ method: "POST", url: `/api/plans/${plan.id}/implement`, headers: auth });
+    await waitFor(() => getTask(db, task.id)?.status === "failed");
+
+    const failed = listWorktrees(db)[0]!;
+    expect(failed.setup_status).toBe("failed");
+    expect(agentCalls).toHaveLength(0);
+
+    writeFileSync(fixed, "");
+    const retry = await server.app.inject({
+      method: "POST",
+      url: `/api/plans/${plan.id}/implement`,
+      headers: auth,
+    });
+    expect(retry.statusCode).toBe(202);
+    await waitFor(() => getTask(db, task.id)?.status === "done");
+
+    // A second attempt, on its own path and branch — not a reuse of the
+    // half-installed one.
+    const worktrees = listWorktrees(db); // newest first
+    expect(worktrees).toHaveLength(2);
+    const fresh = worktrees[0]!;
+    expect(fresh.id).not.toBe(failed.id);
+    expect(fresh.branch).not.toBe(failed.branch);
+    expect(fresh.setup_status).toBe("succeeded");
+
+    // …and the failed attempt is gone: directory, branch, and status.
+    expect(getWorktree(db, failed.id)?.status).toBe("removed");
+    expect(existsSync(failed.worktree_path)).toBe(false);
+    expect(git(["branch", "--list", failed.branch], repoPath)).toBe("");
+
+    // The same approved plan reached the agent, in the new worktree.
+    expect(agentCalls).toEqual([
+      { runId: retry.json().run.id, worktreePath: fresh.worktree_path, taskStatus: "implementing" },
+    ]);
   });
 
   it("exposes the setup state and (empty) todo list on the run endpoint", async () => {

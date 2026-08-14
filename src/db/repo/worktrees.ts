@@ -47,6 +47,13 @@ export function countWorktreesForTask(db: Db, taskId: number): number {
   return row.n;
 }
 
+/** Every worktree ever created for a task, newest first — including removed ones. */
+export function listWorktreesForTask(db: Db, taskId: number): WorktreeRow[] {
+  return db
+    .prepare("SELECT * FROM worktrees WHERE task_id = ? ORDER BY id DESC")
+    .all(taskId) as unknown as WorktreeRow[];
+}
+
 export function listWorktrees(db: Db): WorktreeRow[] {
   return db
     .prepare("SELECT * FROM worktrees ORDER BY id DESC")
@@ -89,6 +96,24 @@ export function markWorktreeSetupFinished(
         SET setup_status = ?, setup_exit_code = ?, setup_output = ?, setup_ended_at = ?
       WHERE id = ?`
   ).run(result.status, result.exitCode, result.output, nowIso(), id);
+}
+
+/**
+ * Records that this worktree's branch was merged into the main checkout.
+ * Status moves to 'retained': the worktree is still on disk (the user may
+ * want to keep poking at it) but it is no longer the live workspace for the
+ * task, and re-merging it would be a no-op.
+ */
+export function markWorktreeMerged(
+  db: Db,
+  id: number,
+  result: { mergeCommit: string; targetBranch: string }
+): void {
+  db.prepare(
+    `UPDATE worktrees
+        SET status = 'retained', merged_at = ?, merge_commit = ?, merge_target_branch = ?
+      WHERE id = ?`
+  ).run(nowIso(), result.mergeCommit, result.targetBranch, id);
 }
 
 /** Worktrees whose setup was still 'running' when the process died — used by boot reconciliation. */

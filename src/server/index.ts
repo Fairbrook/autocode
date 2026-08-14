@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expandHome, loadConfig, loadProjectSeeds, resolveBindHost } from "../config.ts";
@@ -24,7 +25,9 @@ import {
   setWorktreeStatus,
   createWorktree,
   countWorktreesForTask,
+  listWorktreesForTask,
   markWorktreeSetupFinished,
+  markWorktreeMerged,
   listWorktreesBySetupStatus,
 } from "../db/repo/worktrees.ts";
 import { listPendingApprovals } from "../db/repo/approvals.ts";
@@ -34,6 +37,13 @@ import { listRunLog, appendRunLog } from "../db/repo/log.ts";
 import { getRunTodos } from "../db/repo/todos.ts";
 import { runPlanner } from "../agent/planner.ts";
 import { createWorktreeOnDisk, removeWorktreeFromDisk, getDiffStat } from "../worktree/manager.ts";
+import {
+  collectWorktreeChanges,
+  getMergeState,
+  mergeWorktree,
+  MergeBlockedError,
+  type MergeMode,
+} from "../worktree/review.ts";
 import { runImplementationPipeline, type RunAgent } from "./implement.ts";
 import { registerAuth } from "./auth.ts";
 import { countUsers } from "../db/repo/users.ts";
@@ -335,6 +345,33 @@ export async function buildServer(options: BuildServerOptions = {}) {
     const project = getProject(db, task.project_id);
     if (!project) return reply.code(404).send({ error: "project not found" });
 
+    // Retrying after a failed setup (the "Retry with the same plan" button):
+    // that worktree holds nothing but a half-finished install — the agent is
+    // never handed one — and only the newest worktree is reachable from the
+    // UI, so leaving it behind orphans a directory and a branch nobody can
+    // get back to. Best-effort: if the removal fails the retry still goes
+    // ahead, because `attempt` counts rows (removed ones included) and the
+    // new worktree therefore lands on a fresh path and branch either way.
+    for (const stale of listWorktreesForTask(db, task.id)) {
+      if (stale.status !== "active" || stale.setup_status !== "failed") continue;
+      try {
+        removeWorktreeFromDisk({
+          repoPath: stale.repo_path,
+          worktreePath: stale.worktree_path,
+          scratchPath: stale.scratch_path,
+          branch: stale.branch,
+          deleteBranch: true,
+          force: true,
+        });
+        setWorktreeStatus(db, stale.id, "removed");
+      } catch (err) {
+        app.log.warn(
+          { worktreeId: stale.id, branch: stale.branch, err },
+          "could not clean up the worktree left behind by a failed setup"
+        );
+      }
+    }
+
     const attempt = countWorktreesForTask(db, task.id) + 1;
     const wt = createWorktreeOnDisk({
       repoPath: project.repo_path,
@@ -448,6 +485,99 @@ export async function buildServer(options: BuildServerOptions = {}) {
     if (!wt) return reply.code(404).send({ error: "worktree not found" });
     return getDiffStat(wt.worktree_path, wt.base_sha);
   });
+  /**
+   * Everything the review pane needs in one call: the per-file diff of the
+   * whole branch against its base, plus whether merging it into the main
+   * checkout is currently possible.
+   */
+  app.get<{ Params: { id: string } }>("/api/worktrees/:id/changes", async (req, reply) => {
+    const wt = getWorktree(db, Number(req.params.id));
+    if (!wt) return reply.code(404).send({ error: "worktree not found" });
+    if (!existsSync(wt.worktree_path)) {
+      return reply.code(410).send({ error: "the worktree is no longer on disk" });
+    }
+    const changes = collectWorktreeChanges(wt.worktree_path, wt.base_sha);
+    return {
+      worktree: wt,
+      files: changes.files,
+      stat: changes.stat,
+      merge: getMergeState({
+        repoPath: wt.repo_path,
+        worktreePath: wt.worktree_path,
+        branch: wt.branch,
+        baseSha: wt.base_sha,
+      }),
+    };
+  });
+
+  /**
+   * Merges the worktree's branch into whatever the main checkout has checked
+   * out. This is the only endpoint that writes to the user's own repository,
+   * so every refusal it can make is a 409 the UI explains rather than a
+   * half-finished merge left in the working tree.
+   */
+  app.post<{
+    Params: { id: string };
+    Body?: { mode?: MergeMode; message?: string; removeWorktree?: boolean };
+  }>("/api/worktrees/:id/merge", async (req, reply) => {
+    const wt = getWorktree(db, Number(req.params.id));
+    if (!wt) return reply.code(404).send({ error: "worktree not found" });
+    const task = getTask(db, wt.task_id);
+    const body = req.body ?? {};
+    const mode = body.mode === "squash" ? "squash" : "merge";
+    const message =
+      body.message?.trim() ||
+      `${task ? task.title : `autocode task #${wt.task_id}`}\n\n[autocode] merged from ${wt.branch}`;
+
+    let result;
+    try {
+      result = mergeWorktree({
+        repoPath: wt.repo_path,
+        worktreePath: wt.worktree_path,
+        branch: wt.branch,
+        mode,
+        message,
+      });
+    } catch (err) {
+      if (err instanceof MergeBlockedError) {
+        app.log.warn(
+          { worktreeId: wt.id, code: err.code },
+          `merge refused: ${err.message}`
+        );
+        return reply.code(409).send({ error: err.message, code: err.code, ...err.details });
+      }
+      throw err;
+    }
+
+    markWorktreeMerged(db, wt.id, {
+      mergeCommit: result.headSha,
+      targetBranch: result.targetBranch,
+    });
+
+    let removed = false;
+    if (body.removeWorktree) {
+      // The commits are reachable from the target branch now, so dropping the
+      // branch loses nothing — and it keeps a later retry of this task from
+      // colliding with a leftover branch name (see removeWorktreeFromDisk).
+      removeWorktreeFromDisk({
+        repoPath: wt.repo_path,
+        worktreePath: wt.worktree_path,
+        scratchPath: wt.scratch_path,
+        branch: wt.branch,
+        deleteBranch: true,
+        force: true,
+      });
+      setWorktreeStatus(db, wt.id, "removed");
+      removed = true;
+    }
+
+    app.log.info(
+      { worktreeId: wt.id, branch: wt.branch, into: result.targetBranch, mode, removed },
+      "worktree merged into the main checkout"
+    );
+    return { ok: true, ...result, removed, worktree: getWorktree(db, wt.id) };
+  });
+
   app.post<{ Params: { id: string } }>("/api/worktrees/:id/discard", async (req, reply) => {
     const wt = getWorktree(db, Number(req.params.id));
     if (!wt) return reply.code(404).send({ error: "worktree not found" });

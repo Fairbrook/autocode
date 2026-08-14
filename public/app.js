@@ -19,11 +19,15 @@ function fmtCost(usd) {
 // ---------- Router ----------
 async function router() {
   const hash = location.hash.slice(1) || "/";
+  app.className = "";
   try {
     if (hash === "/") return renderHome();
     if (hash === "/history") return renderHistory();
-    const taskMatch = hash.match(/^\/tasks\/(\d+)$/);
-    if (taskMatch) return renderTask(Number(taskMatch[1]));
+    // The optional trailing segment is the step the user pinned on the task
+    // timeline (`#/tasks/12/review`); without it the page follows whatever
+    // step the task is actually on.
+    const taskMatch = hash.match(/^\/tasks\/(\d+)(?:\/([a-z]+))?$/);
+    if (taskMatch) return renderTask(Number(taskMatch[1]), taskMatch[2]);
     app.innerHTML = `<p class="error-text">Unknown route.</p>`;
   } catch (err) {
     app.innerHTML = `<div class="card"><p class="error-text">${esc(err.message)}</p></div>`;
@@ -169,41 +173,60 @@ async function renderHistory() {
 // ---------- Task detail ----------
 let activeStream = null;
 
-async function renderTask(taskId) {
+/** A task moves through these in order; the timeline is one entry per key. */
+const STEP_KEYS = ["plan", "setup", "implementation", "review"];
+
+/** The step pinned in the URL (`#/tasks/12/review`), or null when the page should follow the task. */
+function pinnedStep() {
+  const m = location.hash.slice(1).match(/^\/tasks\/\d+\/([a-z]+)$/);
+  return m ? m[1] : null;
+}
+
+/** Navigates to a step. Passing null unpins, so the page follows the task again. */
+function goToTask(taskId, step) {
+  const next = `#/tasks/${taskId}${step ? `/${step}` : ""}`;
+  // Assigning an unchanged hash fires no hashchange, so re-render directly.
+  if (location.hash === next) renderTask(taskId, step ?? undefined);
+  else location.hash = next;
+}
+
+async function renderTask(taskId, requestedStep) {
   if (activeStream) { activeStream.close(); activeStream = null; }
 
   const { task, runs, plan } = await api.getTask(taskId);
 
   // runs are ordered newest-first, so this is the current attempt.
-  const implRun = runs.find((r) => r.phase === "implementation");
+  const implRun = runs.find((r) => r.phase === "implementation") ?? null;
   // Detail carries the pieces the task endpoint doesn't: the agent's task
   // list and the worktree's setup state.
   const detail = implRun ? await api.getRun(implRun.id) : null;
   const live = Boolean(implRun && (implRun.status === "running" || implRun.status === "queued"));
-  const planSteps = plan ? JSON.parse(plan.steps_json) : [];
 
-  let body = "";
-  if (plan && plan.status === "pending") {
-    body = renderPlanReview(plan);
-  } else if (plan && (plan.status === "approved") && task.status === "approved") {
-    body = `
-      <div class="card">
-        <h2>Plan approved</h2>
-        <p>${esc(plan.summary)}</p>
-        <button class="primary" id="start-impl">Start implementation</button>
-      </div>
-    `;
-  } else if (task.status === "failed") {
-    // The failure could have happened during planning (no implementation
-    // run exists yet), during worktree setup, or during implementation.
-    const failedRun = runs.find((r) => r.status === "failed") || runs[0];
-    body = renderSetupCard(detail?.worktree, false) + renderFailure(failedRun);
-  } else if (task.status === "setting_up" || task.status === "implementing" || task.status === "done") {
-    body = renderRunView(implRun, detail, planSteps, live);
-  } else {
-    body = `<div class="card"><p class="muted">Planning in progress…</p></div>`;
-  }
+  const ctx = {
+    taskId,
+    task,
+    runs,
+    plan,
+    planSteps: plan ? JSON.parse(plan.steps_json) : [],
+    implRun,
+    detail,
+    worktree: detail?.worktree ?? null,
+    live,
+  };
+  // Whether this render will attach the SSE stream. Panes that the stream
+  // fills (the run log, the setup output) must not also render their stored
+  // copy, because a fresh connection replays the whole log from seq 0.
+  ctx.streaming = Boolean(
+    implRun && (live || task.status === "setting_up" || task.status === "implementing")
+  );
 
+  const steps = buildSteps(ctx);
+  const progressKey = progressStepKey(ctx, steps);
+  const requested = steps.find((s) => s.key === requestedStep && s.available);
+  ctx.step = requested ? requested.key : progressKey;
+
+  // The review step wants the room: file sidebar plus diff.
+  app.className = ctx.step === "review" ? "wide" : "";
   app.innerHTML = `
     <div class="card">
       <div class="row between">
@@ -212,28 +235,329 @@ async function renderTask(taskId) {
       </div>
       <p class="muted">${esc(task.description)}</p>
     </div>
-    ${body}
+    ${renderTimeline(steps, progressKey, ctx.step)}
+    <div id="step-panel">${renderStep(ctx)}</div>
   `;
 
-  if (plan && plan.status === "pending") wirePlanReview(plan);
-  const startBtn = document.getElementById("start-impl");
-  if (startBtn) {
-    startBtn.addEventListener("click", async () => {
+  document.getElementById("timeline").addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-step]");
+    if (btn && !btn.disabled) goToTask(taskId, btn.dataset.step);
+  });
+  wireStep(ctx);
+}
+
+/**
+ * The four steps, each with whether it can be opened yet and a one-word
+ * subtitle. A step is available once the thing it shows exists — going back
+ * to a finished step is always allowed, jumping ahead to one that hasn't
+ * happened is not.
+ */
+function buildSteps(ctx) {
+  const { task, plan, implRun, worktree, live } = ctx;
+  const planningFailed = task.status === "failed" && !implRun;
+  const setupFailed = worktree?.setup_status === "failed";
+
+  return [
+    {
+      key: "plan",
+      label: "Plan",
+      sub: plan
+        ? plan.status === "pending"
+          ? "needs review"
+          : plan.status
+        : planningFailed
+          ? "failed"
+          : "planning…",
+      available: true,
+      failed: planningFailed,
+    },
+    {
+      key: "setup",
+      label: "Setup",
+      sub: worktree ? worktree.setup_status : "not started",
+      available: Boolean(worktree),
+      failed: Boolean(setupFailed),
+    },
+    {
+      key: "implementation",
+      label: "Implementation",
+      sub: implRun ? implRun.status : "not started",
+      available: Boolean(implRun),
+      failed: task.status === "failed" && Boolean(implRun) && !setupFailed,
+    },
+    {
+      key: "review",
+      label: "Review",
+      sub: !worktree
+        ? "no worktree"
+        : worktree.merged_at
+          ? "merged"
+          : worktree.status === "removed"
+            ? "discarded"
+            : live
+              ? "waiting"
+              : "ready",
+      // A stopped run is reviewable even if it failed — a half-finished
+      // branch is often exactly what the user wants to look at.
+      available: Boolean(worktree) && !live && worktree.status !== "removed",
+      failed: false,
+    },
+  ];
+}
+
+/** Where the task actually is right now — the step shown unless the user pinned another. */
+function progressStepKey(ctx, steps) {
+  const { task, implRun, worktree } = ctx;
+  let wanted = "plan";
+  if (task.status === "done") wanted = "review";
+  else if (task.status === "setting_up") wanted = "setup";
+  else if (task.status === "implementing") wanted = "implementation";
+  else if (task.status === "failed") {
+    wanted = worktree?.setup_status === "failed" ? "setup" : implRun ? "implementation" : "plan";
+  }
+  // Fall back down the timeline if that step can't be opened (e.g. a merged
+  // task whose worktree has since been removed).
+  for (let i = STEP_KEYS.indexOf(wanted); i > 0; i--) {
+    if (steps[i].available) return steps[i].key;
+  }
+  return steps[STEP_KEYS.indexOf(wanted)]?.available ? wanted : "plan";
+}
+
+/**
+ * Two things are drawn at once: how far the task has got (dot fill and the
+ * connector between dots) and which step the user is looking at (the
+ * highlighted pill). They're usually the same step, but not while the user
+ * is reading back through earlier ones.
+ */
+function renderTimeline(steps, progressKey, selectedKey) {
+  const progressIndex = STEP_KEYS.indexOf(progressKey);
+  return `
+    <nav class="timeline" id="timeline">
+      ${steps.map((s, i) => {
+        const state = s.failed
+          ? "failed"
+          : i < progressIndex ? "done" : i === progressIndex ? "active" : "todo";
+        const mark = s.failed ? "✕" : state === "done" ? "✓" : String(i + 1);
+        return `
+          <button class="tl-step ${state}${s.key === selectedKey ? " selected" : ""}"
+                  data-step="${s.key}" ${s.available ? "" : "disabled"}
+                  title="${esc(s.available ? s.label : `${s.label} — not reached yet`)}">
+            <span class="tl-dot">${mark}</span>
+            <span class="tl-label">${esc(s.label)}</span>
+            <span class="tl-sub">${esc(s.sub)}</span>
+          </button>
+        `;
+      }).join("")}
+    </nav>
+  `;
+}
+
+function renderStep(ctx) {
+  if (ctx.step === "plan") return renderPlanStep(ctx);
+  if (ctx.step === "setup") return renderSetupStep(ctx);
+  if (ctx.step === "implementation") return renderImplementationStep(ctx);
+  return renderReviewStep(ctx);
+}
+
+function wireStep(ctx) {
+  const { step, taskId, plan, implRun } = ctx;
+
+  if (step === "plan") {
+    if (plan?.status === "pending") wirePlanReview(plan);
+    const startBtn = document.getElementById("start-impl");
+    startBtn?.addEventListener("click", async () => {
       startBtn.disabled = true;
       startBtn.textContent = "Starting…";
       try {
         await api.implementPlan(plan.id);
-        renderTask(taskId);
+        goToTask(taskId, null); // follow the task into setup
       } catch (err) {
         alert(err.message);
         startBtn.disabled = false;
+        startBtn.textContent = "Start implementation";
       }
     });
   }
 
-  if (implRun && (live || task.status === "setting_up" || task.status === "implementing")) {
-    wireLiveRun(implRun.id, planSteps, detail?.todos ?? null);
+  if (step === "setup") wireSetupRetry(ctx);
+
+  if ((step === "setup" || step === "implementation") && ctx.streaming) {
+    wireLiveRun(implRun.id, ctx);
   }
+
+  if (step === "review" && ctx.worktree && !ctx.live && ctx.worktree.status !== "removed") {
+    wireReview(ctx.worktree);
+  }
+}
+
+// ---------- Step: plan ----------
+function renderPlanStep(ctx) {
+  const { plan, task, runs } = ctx;
+  if (!plan) {
+    if (task.status === "failed") return renderFailure(runs.find((r) => r.phase === "planning"));
+    return `<div class="card"><p class="muted">Planning in progress…</p></div>`;
+  }
+  if (plan.status === "pending") return renderPlanReview(plan);
+
+  const canStart = plan.status === "approved" && task.status === "approved";
+  return renderPlanSummary(
+    plan,
+    canStart
+      ? `<div class="row" style="margin-top:1rem">
+           <button class="primary" id="start-impl">Start implementation</button>
+           <span class="muted">Creates a worktree and installs the project's dependencies.</span>
+         </div>`
+      : ""
+  );
+}
+
+/** Read-only view of a plan that is no longer editable — what was agreed, for looking back at. */
+function renderPlanSummary(plan, footer) {
+  const steps = JSON.parse(plan.steps_json).sort((a, b) => a.order - b.order);
+  const risks = JSON.parse(plan.risks_json || "[]");
+  const files = JSON.parse(plan.files_json || "[]");
+  return `
+    <div class="card">
+      <div class="row between">
+        <h2 style="margin:0">Plan</h2>
+        <span class="muted">v${plan.version}${plan.source === "user_edit" ? " · edited by you" : ""} ${badge(plan.status)}</span>
+      </div>
+      <p>${esc(plan.summary)}</p>
+      <p class="muted">
+        ${esc(plan.task_category)} · TDD ${plan.tdd_applies ? "applies" : "does not apply"} — ${esc(plan.tdd_rationale)}
+      </p>
+      ${plan.approval_note ? `<p class="muted">Note on approval: “${esc(plan.approval_note)}”</p>` : ""}
+      <h3>Steps</h3>
+      <ol class="plan-list">${steps.map((s) => `<li>${esc(s.description)}</li>`).join("")}</ol>
+      ${risks.length ? `<h3>Risks</h3><ul class="plan-list">${risks.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>` : ""}
+      ${files.length ? `<h3>Files expected to change</h3><ul class="plan-list mono">${files.map((f) => `<li>${esc(f)}</li>`).join("")}</ul>` : ""}
+      ${footer || ""}
+    </div>
+  `;
+}
+
+// ---------- Step: setup ----------
+function renderSetupStep(ctx) {
+  const { worktree, implRun, plan, streaming } = ctx;
+  if (!worktree) {
+    return `<div class="card"><p class="muted">No worktree yet — approve the plan and start the implementation first.</p></div>`;
+  }
+  const failed = worktree.setup_status === "failed";
+  return `
+    ${renderWorktreeCard(worktree)}
+    ${worktree.setup_status === "skipped"
+      ? `<div class="card">
+           <h3>Environment setup</h3>
+           <p class="muted">No setup command is configured for this project, so the agent started straight away.</p>
+         </div>`
+      : renderSetupCard(worktree, streaming)}
+    ${failed ? renderFailure(implRun) : ""}
+    ${failed ? renderSetupRetry(plan) : ""}
+  `;
+}
+
+/**
+ * Setup fails on the environment, not on the plan — a stale lockfile, a
+ * missing toolchain, no network. Once that's fixed the same approved plan
+ * should just run, so the retry starts a fresh attempt from it rather than
+ * sending the user back through planning.
+ */
+function renderSetupRetry(plan) {
+  if (plan?.status !== "approved") return "";
+  return `
+    <div class="card">
+      <h3 style="margin-top:0">Try again</h3>
+      <p class="muted">
+        Fix the environment (or the project's setup command), then run plan v${plan.version}
+        again in a new worktree. The failed one is discarded.
+      </p>
+      <div class="row">
+        <button class="primary" id="retry-setup">Retry with the same plan</button>
+        <span class="muted" id="retry-status"></span>
+      </div>
+    </div>
+  `;
+}
+
+/**
+ * Same endpoint the "Start implementation" button uses: it already treats a
+ * second call as a new attempt (fresh worktree, fresh branch, setup from
+ * scratch), so a retry is just that call again with the plan unchanged.
+ */
+function wireSetupRetry(ctx) {
+  const btn = document.getElementById("retry-setup");
+  if (!btn) return;
+  const statusEl = document.getElementById("retry-status");
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    statusEl.className = "muted";
+    statusEl.textContent = "Starting a new attempt…";
+    try {
+      await api.implementPlan(ctx.plan.id);
+      goToTask(ctx.taskId, null); // unpin, so the page follows the new attempt
+    } catch (err) {
+      statusEl.className = "error-text";
+      statusEl.textContent = err.message;
+      btn.disabled = false;
+    }
+  });
+}
+
+function renderWorktreeCard(worktree) {
+  return `
+    <div class="card">
+      <div class="row between">
+        <h3 style="margin:0">Worktree</h3>
+        ${badge(worktree.status)}
+      </div>
+      <dl class="kv">
+        <dt>Branch</dt><dd>${esc(worktree.branch)}</dd>
+        <dt>Path</dt><dd>${esc(worktree.worktree_path)}</dd>
+        <dt>Base</dt><dd>${esc(worktree.base_ref)} @ ${esc((worktree.base_sha || "").slice(0, 8))}</dd>
+        ${worktree.merged_at
+          ? `<dt>Merged</dt><dd>into ${esc(worktree.merge_target_branch || "?")} at ${esc((worktree.merge_commit || "").slice(0, 8))}</dd>`
+          : ""}
+      </dl>
+    </div>
+  `;
+}
+
+// ---------- Step: implementation ----------
+function renderImplementationStep(ctx) {
+  const { implRun, detail, planSteps, streaming, task, worktree } = ctx;
+  if (!implRun) {
+    return `<div class="card"><p class="muted">The implementation hasn't started yet.</p></div>`;
+  }
+  // A failed setup is reported on its own step; repeating it here would
+  // blame the agent for something that happened before it ran.
+  const failedHere = task.status === "failed" && worktree?.setup_status !== "failed";
+  return `
+    ${failedHere ? renderFailure(implRun) : ""}
+    ${renderRunView(implRun, detail, planSteps, streaming)}
+  `;
+}
+
+// ---------- Step: review ----------
+function renderReviewStep(ctx) {
+  const { worktree, live } = ctx;
+  if (!worktree) {
+    return `<div class="card"><p class="muted">There is nothing to review yet.</p></div>`;
+  }
+  if (worktree.status === "removed") {
+    return `
+      <div class="card">
+        <p class="muted">
+          This worktree was ${worktree.merged_at
+            ? `merged into <code>${esc(worktree.merge_target_branch || "?")}</code> and removed`
+            : "discarded"} — there is nothing left to review.
+        </p>
+      </div>
+    `;
+  }
+  if (live) {
+    return `<div class="card"><p class="muted">The implementation is still running — the diff appears once it stops.</p></div>`;
+  }
+  return reviewCardShell(worktree);
 }
 
 function renderPlanReview(plan) {
@@ -443,7 +767,7 @@ function wirePlanReview(plan) {
     try {
       const { changed } = await api.revisePlan(plan.id, collectPlanEdits());
       statusEl.textContent = changed ? "Saved as a new version." : "No changes to save.";
-      if (changed) setTimeout(() => renderTask(plan.task_id), 400);
+      if (changed) setTimeout(() => goToTask(plan.task_id, "plan"), 400);
     } catch (err) {
       statusEl.textContent = err.message;
     } finally {
@@ -549,10 +873,9 @@ function renderTodoList(todos, planSteps) {
   `;
 }
 
-function renderRunView(run, detail, planSteps, live) {
+function renderRunView(run, detail, planSteps, streaming) {
   if (!run) return `<div class="card"><p class="muted">Waiting for the implementation run to start…</p></div>`;
   return `
-    ${renderSetupCard(detail?.worktree, live)}
     <div class="card">
       <div class="row between">
         <h2 style="margin:0">Implementation ${badge(run.status)}</h2>
@@ -562,54 +885,89 @@ function renderRunView(run, detail, planSteps, live) {
       <div id="todo-area">${renderTodoList(detail?.todos, planSteps)}</div>
       <div id="approvals-area"></div>
       <div id="metrics-area"></div>
-      <h3>Live log</h3>
-      <div class="log" id="run-log"></div>
+      <h3>${streaming ? "Live log" : "Log"}</h3>
+      <div class="log" id="run-log">${streaming ? "" : renderStoredLog(detail?.log)}</div>
     </div>
   `;
 }
 
-async function wireLiveRun(runId, planSteps, initialTodos) {
+/**
+ * The run's log as it was stored. Only used when the stream isn't attached —
+ * a live connection replays the same rows from seq 0, so rendering both
+ * would double every line. Setup output is left out: it belongs to the setup
+ * step, and an install log would bury the agent's own work here.
+ */
+function renderStoredLog(log) {
+  if (!Array.isArray(log) || log.length === 0) {
+    return `<div class="muted">No log entries were recorded for this run.</div>`;
+  }
+  const entries = log
+    .filter((row) => row.kind !== "setup_output")
+    .slice(-500)
+    .map((row) => {
+      let payload = {};
+      try {
+        payload = JSON.parse(row.payload_json);
+      } catch {
+        // A log row we can't parse is still worth showing as its kind alone.
+      }
+      return `<div class="entry"><span class="kind">[${esc(row.kind)}]</span> ${esc(summarize(row.kind, payload))}</div>`;
+    });
+  return entries.length ? entries.join("") : `<div class="muted">No log entries for this run.</div>`;
+}
+
+/** One log row as a single line of text — shared by the live stream and the stored log. */
+function summarize(kind, payload) {
+  if (kind === "assistant" || kind === "user") {
+    const blocks = payload.content || [];
+    return blocks.map((b) => {
+      if (b.type === "text") return b.text;
+      if (b.type === "tool_use") return `→ ${b.name}(${JSON.stringify(b.input).slice(0, 120)})`;
+      if (b.type === "tool_result") return `← ${JSON.stringify(b.content).slice(0, 120)}`;
+      return b.type;
+    }).join(" ");
+  }
+  if (kind === "status") return payload.status;
+  if (kind === "result") return `${payload.subtype} (cost: ${fmtCost(payload.total_cost_usd)})`;
+  if (kind === "notification") return `${payload.title}: ${payload.body}`;
+  if (kind === "todos") {
+    const active = payload.todos.find((t) => t.status === "in_progress");
+    const done = payload.todos.filter((t) => t.status === "completed").length;
+    return `${done}/${payload.todos.length} — ${active ? active.activeForm || active.content : "no item in progress"}`;
+  }
+  if (kind === "setup_status") {
+    return payload.status === "running"
+      ? `running \`${payload.command}\``
+      : `${payload.status}${payload.exitCode != null ? ` (exit ${payload.exitCode})` : ""}${payload.timedOut ? " — timed out" : ""}`;
+  }
+  return JSON.stringify(payload).slice(0, 200);
+}
+
+/**
+ * Attaches the run's event stream to whichever panes the current step
+ * rendered: the setup step has the install log, the implementation step has
+ * the task list, approvals and the run log. Every pane is therefore
+ * optional — the stream itself is the same either way.
+ */
+async function wireLiveRun(runId, ctx) {
   const logEl = document.getElementById("run-log");
   const approvalsEl = document.getElementById("approvals-area");
   const todoEl = document.getElementById("todo-area");
   const setupLogEl = document.getElementById("setup-log");
   const setupBadgeEl = document.getElementById("setup-badge");
-  if (!logEl) return;
 
-  let todos = initialTodos;
+  const planSteps = ctx.planSteps;
+  let todos = ctx.detail?.todos ?? null;
+  /** Guards the one automatic step advance below against the SSE replay. */
+  let advanced = false;
 
   function appendLog(kind, payload) {
+    if (!logEl) return;
     const div = document.createElement("div");
     div.className = "entry";
     div.innerHTML = `<span class="kind">[${esc(kind)}]</span> ${esc(summarize(kind, payload))}`;
     logEl.appendChild(div);
     logEl.scrollTop = logEl.scrollHeight;
-  }
-
-  function summarize(kind, payload) {
-    if (kind === "assistant" || kind === "user") {
-      const blocks = payload.content || [];
-      return blocks.map((b) => {
-        if (b.type === "text") return b.text;
-        if (b.type === "tool_use") return `→ ${b.name}(${JSON.stringify(b.input).slice(0, 120)})`;
-        if (b.type === "tool_result") return `← ${JSON.stringify(b.content).slice(0, 120)}`;
-        return b.type;
-      }).join(" ");
-    }
-    if (kind === "status") return payload.status;
-    if (kind === "result") return `${payload.subtype} (cost: ${fmtCost(payload.total_cost_usd)})`;
-    if (kind === "notification") return `${payload.title}: ${payload.body}`;
-    if (kind === "todos") {
-      const active = payload.todos.find((t) => t.status === "in_progress");
-      const done = payload.todos.filter((t) => t.status === "completed").length;
-      return `${done}/${payload.todos.length} — ${active ? active.activeForm || active.content : "no item in progress"}`;
-    }
-    if (kind === "setup_status") {
-      return payload.status === "running"
-        ? `running \`${payload.command}\``
-        : `${payload.status}${payload.exitCode != null ? ` (exit ${payload.exitCode})` : ""}${payload.timedOut ? " — timed out" : ""}`;
-    }
-    return JSON.stringify(payload).slice(0, 200);
   }
 
   function applySetupOutput(text) {
@@ -624,6 +982,7 @@ async function wireLiveRun(runId, planSteps, initialTodos) {
   }
 
   async function refreshApprovals() {
+    if (!approvalsEl) return;
     const pending = await api.listApprovals(runId);
     approvalsEl.innerHTML = pending.map((a) => `
       <div class="approval-card" data-id="${a.id}">
@@ -668,6 +1027,272 @@ async function wireLiveRun(runId, planSteps, initialTodos) {
     if (kind === "approval_request" || kind === "approval_resolved") refreshApprovals();
     if (kind === "status" && (payload.status === "completed" || payload.status === "failed")) {
       setTimeout(() => router(), 500);
+    }
+    // Setup finished while the user was watching it: follow the task on to
+    // the implementation step, unless they pinned this one. Once per
+    // connection — the replay that follows the re-render carries this same
+    // event again.
+    if (
+      kind === "setup_status" &&
+      payload.status === "succeeded" &&
+      ctx.step === "setup" &&
+      !advanced &&
+      !pinnedStep()
+    ) {
+      advanced = true;
+      setTimeout(() => router(), 400);
+    }
+  });
+}
+
+// ---------- Review changes & merge ----------
+
+/**
+ * The card is painted before the diff arrives: collecting it shells out to
+ * git once per changed file, which is fast but not instant on a big branch,
+ * and the rest of the task page shouldn't wait on it.
+ */
+function reviewCardShell(worktree) {
+  return `
+    <div class="card" id="review-card">
+      <div class="row between">
+        <h2 style="margin:0">Review changes</h2>
+        <span class="muted">${esc(worktree.branch)}</span>
+      </div>
+      <p class="muted" id="review-loading">Collecting the diff…</p>
+      <div id="review-body"></div>
+    </div>
+  `;
+}
+
+async function wireReview(worktree) {
+  const bodyEl = document.getElementById("review-body");
+  const loadingEl = document.getElementById("review-loading");
+  if (!bodyEl) return;
+
+  let changes;
+  try {
+    changes = await api.getWorktreeChanges(worktree.id);
+  } catch (err) {
+    loadingEl.className = "error-text";
+    loadingEl.textContent = err.message;
+    return;
+  }
+  loadingEl.remove();
+
+  const { files, stat, merge } = changes;
+  bodyEl.innerHTML = `
+    ${renderMergePanel(worktree, merge, files)}
+    ${files.length === 0
+      ? `<p class="muted">No changes against <code>${esc(worktree.base_ref)}</code>.</p>`
+      : `
+        <div class="review-split">
+          <nav class="file-list" id="file-tabs" aria-label="Changed files">
+            <div class="file-list-head">
+              <span>${stat.filesChanged} file${stat.filesChanged === 1 ? "" : "s"}</span>
+              <span><span class="diff-plus">+${stat.insertions}</span> <span class="diff-minus">−${stat.deletions}</span></span>
+            </div>
+            ${files.map((f, i) => fileTab(f, i)).join("")}
+          </nav>
+          <div class="diff-panel" id="diff-panel"></div>
+        </div>
+      `}
+  `;
+
+  if (files.length > 0) {
+    const tabsEl = document.getElementById("file-tabs");
+    const panelEl = document.getElementById("diff-panel");
+    const select = (index) => {
+      tabsEl.querySelectorAll("[data-file]").forEach((btn) =>
+        btn.classList.toggle("active", Number(btn.dataset.file) === index)
+      );
+      panelEl.innerHTML = renderFileDiff(files[index]);
+    };
+    tabsEl.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-file]");
+      if (btn) select(Number(btn.dataset.file));
+    });
+    select(0);
+  }
+
+  wireMergeControls(worktree, merge);
+}
+
+const STATUS_MARK = {
+  added: "A",
+  modified: "M",
+  deleted: "D",
+  renamed: "R",
+  copied: "C",
+  type_changed: "T",
+  untracked: "U",
+};
+
+/** One row of the file sidebar: status letter, name over its directory, and the file's own counts. */
+function fileTab(file, index) {
+  const name = file.path.split("/").pop();
+  const dir = file.path.slice(0, file.path.length - name.length);
+  return `
+    <button class="file-tab" data-file="${index}" title="${esc(file.oldPath ? `${file.oldPath} → ${file.path}` : file.path)}">
+      <span class="file-status ${esc(file.status)}">${STATUS_MARK[file.status] || "?"}</span>
+      <span class="file-text">
+        <span class="file-name">${esc(name)}</span>
+        ${dir ? `<span class="file-dir">${esc(dir)}</span>` : ""}
+      </span>
+      <span class="file-counts">${file.binary
+        ? `<span class="muted">bin</span>`
+        : `<span class="diff-plus">+${file.insertions}</span> <span class="diff-minus">−${file.deletions}</span>`}</span>
+    </button>
+  `;
+}
+
+/**
+ * One file's patch, rendered the way git prints it — the +/- markers are kept
+ * and the gutter carries the old/new line numbers read off each @@ hunk
+ * header. Diff headers (index/---/+++/mode lines) are dropped: the tab
+ * already says which file this is and what happened to it.
+ */
+function renderFileDiff(file) {
+  const header = `
+    <div class="diff-file-header">
+      <code>${esc(file.oldPath ? `${file.oldPath} → ${file.path}` : file.path)}</code>
+      <span class="muted">${esc(file.status.replace("_", " "))}</span>
+    </div>
+  `;
+  if (file.binary) {
+    return `${header}<p class="muted">Binary file — no textual diff.</p>`;
+  }
+
+  const skip = /^(diff --git |index |--- |\+\+\+ |new file |deleted file |old mode |new mode |similarity |dissimilarity |rename |copy |Binary files )/;
+  const lines = file.patch.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+
+  let oldNo = 0;
+  let newNo = 0;
+  const rows = [];
+  for (const line of lines) {
+    if (line.startsWith("@@")) {
+      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      oldNo = m ? Number(m[1]) : 0;
+      newNo = m ? Number(m[2]) : 0;
+      rows.push(diffRow("hunk", "", "", line));
+    } else if (skip.test(line)) {
+      continue;
+    } else if (line.startsWith("+")) {
+      rows.push(diffRow("add", "", newNo++, line));
+    } else if (line.startsWith("-")) {
+      rows.push(diffRow("del", oldNo++, "", line));
+    } else if (line.startsWith("\\")) {
+      rows.push(diffRow("meta", "", "", line)); // "\ No newline at end of file"
+    } else {
+      rows.push(diffRow("ctx", oldNo++, newNo++, line));
+    }
+  }
+
+  if (rows.length === 0) {
+    return `${header}<p class="muted">No textual changes (mode or metadata only).</p>`;
+  }
+  return `
+    ${header}
+    <div class="diff">${rows.join("")}</div>
+    ${file.truncated ? `<p class="muted">Diff truncated — open the file in the worktree to see the rest.</p>` : ""}
+  `;
+}
+
+function diffRow(kind, oldNo, newNo, text) {
+  return `<div class="diff-line ${kind}"><span class="ln">${oldNo}</span><span class="ln">${newNo}</span><code>${esc(text)}</code></div>`;
+}
+
+function renderMergePanel(worktree, merge, files) {
+  const target = merge.targetBranch;
+  const notes = [];
+  let blocked = null;
+
+  if (worktree.merged_at) {
+    notes.push(`<div class="merge-note ok">Merged into <code>${esc(worktree.merge_target_branch || "?")}</code> at ${new Date(worktree.merged_at).toLocaleString()} (${esc((worktree.merge_commit || "").slice(0, 8))}).</div>`);
+  }
+  if (target === null) {
+    blocked = "The main checkout is on a detached HEAD — check out a branch there first.";
+  } else if (merge.alreadyMerged) {
+    blocked = `<code>${esc(worktree.branch)}</code> is already part of <code>${esc(target)}</code> — nothing left to merge.`;
+  } else if (!merge.repoClean) {
+    blocked = `<code>${esc(target)}</code> has uncommitted changes. Commit or stash them first:<div class="merge-files">${merge.repoDirtyFiles.map((f) => esc(f)).join("<br>")}</div>`;
+  } else if (files.length === 0) {
+    blocked = "There is nothing to merge.";
+  }
+
+  if (merge.worktreeDirty) {
+    notes.push(`<div class="merge-note">${merge.worktreeDirtyFiles.length} uncommitted file${merge.worktreeDirtyFiles.length === 1 ? "" : "s"} in the worktree will be committed on <code>${esc(worktree.branch)}</code> before merging.</div>`);
+  }
+  if (merge.targetAdvancedBy > 0) {
+    notes.push(`<div class="merge-note">${esc(target || "the target branch")} has moved ${merge.targetAdvancedBy} commit${merge.targetAdvancedBy === 1 ? "" : "s"} since this worktree was created — the merge may conflict.</div>`);
+  }
+
+  const commits = merge.commits.length
+    ? `<div class="muted">${merge.commits.length} commit${merge.commits.length === 1 ? "" : "s"} on this branch: ${esc(merge.commits.map((c) => c.subject).slice(0, 3).join(" · "))}${merge.commits.length > 3 ? " …" : ""}</div>`
+    : `<div class="muted">No commits on this branch yet.</div>`;
+
+  return `
+    <div class="merge-bar">
+      <div class="row between">
+        <div>
+          <strong>Merge <code>${esc(worktree.branch)}</code> into <code>${esc(target || "—")}</code></strong>
+          ${commits}
+        </div>
+        <div class="row">
+          <select id="merge-mode" class="merge-mode">
+            <option value="merge">Merge commit</option>
+            <option value="squash">Squash into one commit</option>
+          </select>
+          <button class="primary" id="do-merge" ${blocked ? "disabled" : ""}>
+            Merge into ${esc(target || "—")}
+          </button>
+        </div>
+      </div>
+      ${blocked ? `<div class="merge-note blocked">${blocked}</div>` : ""}
+      ${notes.join("")}
+      <label for="merge-message">Commit message <span class="muted">(optional)</span></label>
+      <input id="merge-message" placeholder="Defaults to the task title" />
+      <label class="inline"><input type="checkbox" id="merge-remove" /> Remove the worktree after merging</label>
+      <div id="merge-status" class="muted"></div>
+    </div>
+  `;
+}
+
+function wireMergeControls(worktree, merge) {
+  const btn = document.getElementById("do-merge");
+  const statusEl = document.getElementById("merge-status");
+  if (!btn || btn.disabled) return;
+
+  btn.addEventListener("click", async () => {
+    const mode = document.getElementById("merge-mode").value;
+    const removeWorktree = document.getElementById("merge-remove").checked;
+    const message = document.getElementById("merge-message").value.trim();
+    const target = merge.targetBranch;
+    if (!confirm(`${mode === "squash" ? "Squash" : "Merge"} ${worktree.branch} into ${target} in ${worktree.repo_path}?`)) {
+      return;
+    }
+    btn.disabled = true;
+    statusEl.className = "muted";
+    statusEl.textContent = "Merging…";
+    try {
+      const result = await api.mergeWorktree(worktree.id, {
+        mode,
+        removeWorktree,
+        ...(message ? { message } : {}),
+      });
+      statusEl.className = "muted";
+      statusEl.textContent = result.alreadyUpToDate
+        ? `Already up to date with ${result.targetBranch}.`
+        : `Merged into ${result.targetBranch} at ${result.headSha.slice(0, 8)}.`;
+      setTimeout(() => router(), 800);
+    } catch (err) {
+      statusEl.className = "error-text";
+      const conflicts = err.data?.conflicts;
+      statusEl.innerHTML =
+        esc(err.message) +
+        (conflicts?.length ? `<div class="merge-files">${conflicts.map((f) => esc(f)).join("<br>")}</div>` : "");
+      btn.disabled = false;
     }
   });
 }

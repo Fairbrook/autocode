@@ -2,7 +2,7 @@
   {
     "name": "vergil",
     "repoPath": "~/Documents/projects/vergil/",
-    "setupCommand": "cd daemon && uv sync",
+    "setupCommand": "cd daemon && uv sync --extra test --extra server-gpu-cu126",
     "allowedNetworkDomains": [
       "localhost", "127.0.0.1",
       "registry.npmjs.org", "npmjs.org",
