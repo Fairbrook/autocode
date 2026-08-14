@@ -103,6 +103,8 @@ th { color: var(--muted); font-weight: 600; }
 .badge.planning, .badge.running, .badge.implementing, .badge.awaiting_approval, .badge.setting_up { color: var(--warn); border-color: var(--warn); }
 .badge.approved, .badge.done, .badge.completed, .badge.allowed, .badge.succeeded { color: var(--ok); border-color: var(--ok); }
 .badge.failed, .badge.denied, .badge.interrupted, .badge.cancelled, .badge.rejected, .badge.leaked { color: var(--danger); border-color: var(--danger); }
+/* Not a failure — work that finished and is still waiting on the user. */
+.badge.unmerged { color: var(--warn); border-color: var(--warn); }
 
 .log {
   font-family: var(--mono);

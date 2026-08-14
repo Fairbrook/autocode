@@ -20,6 +20,8 @@ let server: Awaited<ReturnType<typeof buildServer>>;
 let db: Db;
 /** Every call the stand-in implementation agent received, in order. */
 let agentCalls: { runId: number; worktreePath: string; taskStatus: string | undefined }[];
+/** Makes the stand-in agent report failure — set per test to exercise the retry path. */
+let agentFails: boolean;
 /** Session cookie for the test account — every request below is authenticated. */
 let auth: Record<string, string>;
 
@@ -80,6 +82,7 @@ beforeEach(async () => {
 
   const { configPath, projectsPath } = writeTestConfig(base);
   agentCalls = [];
+  agentFails = false;
   server = await buildServer({
     configPath,
     projectsPath,
@@ -91,6 +94,14 @@ beforeEach(async () => {
         worktreePath: input.worktree.worktree_path,
         taskStatus: getTask(db, input.task.id)?.status,
       });
+      if (agentFails) {
+        return {
+          ok: false,
+          runId: input.run!.id,
+          errorSummary: "ran out of turns",
+          backgroundLeakedCount: 0,
+        };
+      }
       return { ok: true, runId: input.run!.id, backgroundLeakedCount: 0 };
     },
   });
@@ -267,5 +278,83 @@ describe("POST /api/plans/:id/implement — worktree setup", () => {
     const detail = (await server.app.inject({ method: "GET", url: `/api/runs/${runId}`, headers: auth })).json();
     expect(detail.worktree.setup_status).toBe("failed");
     expect(detail.todos).toBeNull();
+  });
+});
+
+/** What the implementation step's "Retry with the same plan" button drives. */
+describe("POST /api/plans/:id/implement — retry after a failed implementation", () => {
+  /** Runs the plan once with a failing agent and returns the abandoned attempt. */
+  async function failedAttempt() {
+    const project = createProject(db, { name: "demo", repoPath, setupCommand: null });
+    const { task, plan } = approvedPlanFor(project);
+    agentFails = true;
+
+    await server.app.inject({
+      method: "POST",
+      url: `/api/plans/${plan.id}/implement`,
+      headers: auth,
+    });
+    await waitFor(() => getTask(db, task.id)?.status === "failed");
+    agentFails = false;
+    return { task, plan, worktree: listWorktrees(db)[0]! };
+  }
+
+  it("runs the same plan in a new worktree, leaving the failed attempt on disk", async () => {
+    const { task, plan, worktree: first } = await failedAttempt();
+
+    const retry = await server.app.inject({
+      method: "POST",
+      url: `/api/plans/${plan.id}/implement`,
+      headers: auth,
+    });
+    expect(retry.statusCode).toBe(202);
+    await waitFor(() => getTask(db, task.id)?.status === "done");
+
+    const worktrees = listWorktrees(db); // newest first
+    expect(worktrees).toHaveLength(2);
+    const second = worktrees[0]!;
+    expect(second.worktree_path).not.toBe(first.worktree_path);
+    expect(second.branch).not.toBe(first.branch);
+
+    // Unlike a failed setup, the agent ran here and may have committed
+    // something — so the abandoned attempt keeps its worktree, its branch
+    // and its 'active' row until the user discards it explicitly.
+    expect(getWorktree(db, first.id)?.status).toBe("active");
+    expect(existsSync(first.worktree_path)).toBe(true);
+    expect(git(["branch", "--list", first.branch], repoPath)).toContain(first.branch);
+
+    // Both attempts ran the same plan; the second one succeeded.
+    expect(agentCalls.map((c) => c.worktreePath)).toEqual([
+      first.worktree_path,
+      second.worktree_path,
+    ]);
+  });
+
+  it("can discard the failed attempt first, then retry", async () => {
+    const { task, plan, worktree: first } = await failedAttempt();
+
+    const discarded = await server.app.inject({
+      method: "POST",
+      url: `/api/worktrees/${first.id}/discard`,
+      headers: auth,
+    });
+    expect(discarded.statusCode).toBe(200);
+    expect(getWorktree(db, first.id)?.status).toBe("removed");
+    expect(existsSync(first.worktree_path)).toBe(false);
+    expect(git(["branch", "--list", first.branch], repoPath)).toBe("");
+
+    // The discard freed the old branch name, but the retry still gets its
+    // own — attempts are counted from the rows, removed ones included.
+    await server.app.inject({
+      method: "POST",
+      url: `/api/plans/${plan.id}/implement`,
+      headers: auth,
+    });
+    await waitFor(() => getTask(db, task.id)?.status === "done");
+
+    const second = listWorktrees(db)[0]!;
+    expect(second.branch).not.toBe(first.branch);
+    expect(second.status).toBe("active");
+    expect(existsSync(second.worktree_path)).toBe(true);
   });
 });

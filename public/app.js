@@ -12,6 +12,19 @@ function badge(status) {
   return `<span class="badge ${esc(status)}">${esc(status)}</span>`;
 }
 
+/**
+ * `done` only means the implementation run stopped cleanly — the branch is
+ * still sitting in its worktree until someone merges it. That gap is easy to
+ * lose track of once the task drops down the list, so it gets its own badge
+ * alongside the status. A discarded or already-merged worktree has nothing
+ * left to land, and neither does a task that never got that far.
+ */
+function unmergedBadge(task, worktree) {
+  if (task.status !== "done" || !worktree) return "";
+  if (worktree.merged_at || worktree.status === "removed") return "";
+  return `<span class="badge unmerged" title="The implementation finished but ${esc(worktree.branch)} has not been merged yet">unmerged</span>`;
+}
+
 function fmtCost(usd) {
   return usd == null ? "—" : `$${Number(usd).toFixed(4)}`;
 }
@@ -62,7 +75,14 @@ async function setupSession() {
 
 // ---------- Home: project/task submit + task list ----------
 async function renderHome() {
-  const [projects, tasks] = await Promise.all([api.listProjects(), api.listTasks()]);
+  // Worktrees come along so a finished-but-unmerged task is visible from the
+  // list itself, without opening it. They arrive newest-first, so the first
+  // match for a task is its current attempt.
+  const [projects, tasks, worktrees] = await Promise.all([
+    api.listProjects(),
+    api.listTasks(),
+    api.listWorktrees(),
+  ]);
 
   app.innerHTML = `
     <div class="card">
@@ -98,7 +118,7 @@ async function renderHome() {
             ${tasks.map((t) => `
               <tr style="cursor:pointer" onclick="location.hash='#/tasks/${t.id}'">
                 <td>${esc(t.title)}</td>
-                <td>${badge(t.status)}</td>
+                <td>${badge(t.status)} ${unmergedBadge(t, worktrees.find((w) => w.task_id === t.id))}</td>
                 <td class="muted">${new Date(t.updated_at).toLocaleString()}</td>
               </tr>
             `).join("")}
@@ -231,7 +251,10 @@ async function renderTask(taskId, requestedStep) {
     <div class="card">
       <div class="row between">
         <h2 style="margin:0">${esc(task.title)}</h2>
-        ${badge(task.status)}
+        <span class="row" style="gap:0.4rem">
+          ${badge(task.status)}
+          ${unmergedBadge(task, ctx.worktree)}
+        </span>
       </div>
       <p class="muted">${esc(task.description)}</p>
     </div>
@@ -379,7 +402,7 @@ function wireStep(ctx) {
     });
   }
 
-  if (step === "setup") wireSetupRetry(ctx);
+  if (step === "setup" || step === "implementation") wireRetry(ctx);
 
   if ((step === "setup" || step === "implementation") && ctx.streaming) {
     wireLiveRun(implRun.id, ctx);
@@ -452,27 +475,47 @@ function renderSetupStep(ctx) {
          </div>`
       : renderSetupCard(worktree, streaming)}
     ${failed ? renderFailure(implRun) : ""}
-    ${failed ? renderSetupRetry(plan) : ""}
+    ${failed ? renderRetryCard(plan, worktree, "setup") : ""}
   `;
 }
 
 /**
- * Setup fails on the environment, not on the plan — a stale lockfile, a
- * missing toolchain, no network. Once that's fixed the same approved plan
- * should just run, so the retry starts a fresh attempt from it rather than
- * sending the user back through planning.
+ * Neither failure is usually the plan's fault — setup fails on the
+ * environment (a stale lockfile, a missing toolchain, no network), and an
+ * implementation that ran out of turns or hit a transient error was working
+ * from a plan the user already agreed to. So both offer the same escape
+ * hatch: run that same plan again in a fresh worktree, instead of sending
+ * the user back through planning.
+ *
+ * The difference is what happens to the attempt being abandoned. A failed
+ * setup leaves nothing worth keeping — the agent never ran — so the server
+ * discards that worktree as part of the retry. A failed implementation may
+ * have committed real work, so its branch survives by default and only goes
+ * away if the user asks for it.
  */
-function renderSetupRetry(plan) {
+function renderRetryCard(plan, worktree, phase) {
   if (plan?.status !== "approved") return "";
+  const setup = phase === "setup";
   return `
     <div class="card">
       <h3 style="margin-top:0">Try again</h3>
       <p class="muted">
-        Fix the environment (or the project's setup command), then run plan v${plan.version}
-        again in a new worktree. The failed one is discarded.
+        ${setup
+          ? `Fix the environment (or the project's setup command), then run plan v${plan.version}
+             again in a new worktree. The failed one is discarded.`
+          : `Run plan v${plan.version} again in a new worktree off
+             <code>${esc(worktree.base_ref)}</code>, with setup from scratch — nothing this
+             attempt did carries over.`}
       </p>
+      ${setup
+        ? ""
+        : `<label class="inline">
+             <input type="checkbox" id="retry-discard" />
+             Discard this attempt's worktree and branch <code>${esc(worktree.branch)}</code> first
+           </label>
+           <p class="muted">Otherwise it stays on disk, reachable through git but no longer shown here.</p>`}
       <div class="row">
-        <button class="primary" id="retry-setup">Retry with the same plan</button>
+        <button class="primary" id="retry-run">Retry with the same plan</button>
         <span class="muted" id="retry-status"></span>
       </div>
     </div>
@@ -484,15 +527,23 @@ function renderSetupRetry(plan) {
  * second call as a new attempt (fresh worktree, fresh branch, setup from
  * scratch), so a retry is just that call again with the plan unchanged.
  */
-function wireSetupRetry(ctx) {
-  const btn = document.getElementById("retry-setup");
+function wireRetry(ctx) {
+  const btn = document.getElementById("retry-run");
   if (!btn) return;
   const statusEl = document.getElementById("retry-status");
+  const discardEl = document.getElementById("retry-discard");
   btn.addEventListener("click", async () => {
     btn.disabled = true;
     statusEl.className = "muted";
-    statusEl.textContent = "Starting a new attempt…";
     try {
+      // Before the new attempt, not after: two worktrees for one task is
+      // exactly the state this checkbox exists to avoid, and if the discard
+      // fails the user still has the branch they asked to be rid of.
+      if (discardEl?.checked) {
+        statusEl.textContent = "Discarding this attempt…";
+        await api.discardWorktree(ctx.worktree.id);
+      }
+      statusEl.textContent = "Starting a new attempt…";
       await api.implementPlan(ctx.plan.id);
       goToTask(ctx.taskId, null); // unpin, so the page follows the new attempt
     } catch (err) {
@@ -524,7 +575,7 @@ function renderWorktreeCard(worktree) {
 
 // ---------- Step: implementation ----------
 function renderImplementationStep(ctx) {
-  const { implRun, detail, planSteps, streaming, task, worktree } = ctx;
+  const { implRun, detail, planSteps, streaming, task, worktree, plan } = ctx;
   if (!implRun) {
     return `<div class="card"><p class="muted">The implementation hasn't started yet.</p></div>`;
   }
@@ -533,6 +584,7 @@ function renderImplementationStep(ctx) {
   const failedHere = task.status === "failed" && worktree?.setup_status !== "failed";
   return `
     ${failedHere ? renderFailure(implRun) : ""}
+    ${failedHere && worktree ? renderRetryCard(plan, worktree, "implementation") : ""}
     ${renderRunView(implRun, detail, planSteps, streaming)}
   `;
 }
