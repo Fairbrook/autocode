@@ -155,6 +155,11 @@ export interface WorktreeRow {
   merged_at: string | null;
   merge_commit: string | null;
   merge_target_branch: string | null;
+  /** Set once the branch was pushed and proposed as a pull request — see the 008 migration. */
+  pr_url: string | null;
+  pr_number: number | null;
+  pr_base_branch: string | null;
+  pr_opened_at: string | null;
 }
 
 export interface ApprovalRequestRow {

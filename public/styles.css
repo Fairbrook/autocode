@@ -117,6 +117,8 @@ th { color: var(--muted); font-weight: 600; }
 .badge.failed, .badge.denied, .badge.interrupted, .badge.cancelled, .badge.rejected, .badge.leaked { color: var(--danger); border-color: var(--danger); }
 /* Not a failure — work that finished and is still waiting on the user. */
 .badge.unmerged { color: var(--warn); border-color: var(--warn); }
+/* Also unlanded, but the wait is on a review somewhere else. */
+.badge.pr-open { color: var(--accent); border-color: var(--accent); }
 
 .log {
   font-family: var(--mono);
@@ -141,6 +143,62 @@ th { color: var(--muted); font-weight: 600; }
 }
 .approval-card .command { font-family: var(--mono); font-size: 0.85rem; background: var(--bg); padding: 0.4rem 0.6rem; border-radius: 4px; margin: 0.4rem 0; }
 .approval-card .reason { font-size: 0.85rem; color: var(--muted); }
+
+/* ---- The agent's multiple-choice question (AskUserQuestion) ---- */
+.question-card { border-color: var(--accent); }
+.question + .question { border-top: 1px solid var(--border); padding-top: 0.75rem; margin-top: 0.75rem; }
+.question-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0.6rem 0 0.5rem;
+  font-size: 0.92rem;
+}
+.chip {
+  flex: none;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
+}
+
+.option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  width: auto;
+  margin: 0 0 0.3rem;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+.option:hover { border-color: var(--accent); }
+.option:has(input:checked) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+.option > input { width: auto; flex: none; margin-top: 0.25rem; }
+.option-text { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; flex: 1 1 auto; }
+.option-label { font-weight: 600; }
+.option-desc { font-size: 0.82rem; color: var(--muted); }
+.option-other { font-size: 0.85rem; padding: 0.3rem 0.45rem; }
+.option-preview {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  margin: 0 0 0.3rem 1.9rem;
+  overflow-x: auto;
+}
 
 .muted { color: var(--muted); font-size: 0.85rem; }
 .error-text { color: var(--danger); font-size: 0.85rem; }
@@ -398,6 +456,26 @@ th { color: var(--muted); font-weight: 600; }
 .diff-line.hunk { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--muted); }
 .diff-line.meta { color: var(--muted); }
 
+/* ---- Landing the branch: merge locally vs. open a pull request ---- */
+.land-tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  margin: -0.25rem 0 0.75rem;
+}
+.land-tab {
+  border: none;
+  background: none;
+  border-radius: 6px 6px 0 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  padding: 0.4rem 0.7rem;
+  font-size: 0.88rem;
+  margin-bottom: -1px;
+}
+.land-tab:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.land-tab.active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
+
 /* ---- Merge panel ---- */
 .merge-bar {
   border: 1px solid var(--border);
@@ -407,6 +485,10 @@ th { color: var(--muted); font-weight: 600; }
 }
 .merge-bar code { font-family: var(--mono); font-size: 0.85em; }
 .merge-mode { width: auto; }
+/* Base branch: a searchable field rather than a select, because a repo can
+   have hundreds of branches and the one you want is rarely near the top. */
+.base-field { display: flex; align-items: center; gap: 0.4rem; width: auto; margin: 0; }
+.base-input { width: 14rem; font-family: var(--mono); font-size: 0.85rem; }
 .merge-note {
   margin-top: 0.5rem;
   font-size: 0.85rem;

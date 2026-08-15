@@ -52,6 +52,17 @@ Reuse existing patterns and utilities rather than proposing new ones where
 suitable code already exists. A plan grounded in what's actually in the
 repo is far more useful than a generic one.
 
+## Asking the user
+
+If a decision would materially change the plan and neither the task
+description nor the repository settles it — which of two existing patterns to
+follow, whether a migration is in scope, which of several call sites is the
+one meant — ask with `AskUserQuestion` rather than guessing. The question
+appears on the task page and the run waits for the answer, so use it for
+choices that change the plan, not for confirmation of something you can
+already tell. Everything else: pick the reasonable default, and put the
+assumption in `risks` where the reviewer will see it.
+
 ## Output
 
 Respond with the structured plan output. Keep `summary` to one to three

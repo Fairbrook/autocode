@@ -55,17 +55,63 @@ checkout.
 the branch. The commits survive on the target branch, and dropping the branch
 keeps a later retry of the same task from colliding with the old branch name.
 
+## Opening a pull request instead
+
+The review panel has two tabs: **Merge locally** and **Open a pull request**.
+The second pushes the branch to the repository's remote and opens a PR against
+a base branch you pick, without touching your main checkout at all — which is
+why it stays available when merging is blocked (a dirty checkout, a detached
+HEAD, or a change you'd rather have reviewed before it lands). The panel opens
+on whichever tab is actually usable.
+
+GitHub is reached through the **`gh` CLI**, so autocode never stores a token of
+its own: whatever `gh auth login` (or `GH_TOKEN`) set up for the user running
+the server is what gets used. The review pane checks for `gh` and for a stored
+credential locally — `gh auth token`, no network call — and explains which one
+is missing rather than offering a button that fails.
+
+The base branch is a searchable field, not a dropdown: a repo can have
+hundreds of remote branches, so it suggests them newest-commit-first with the
+default pinned to the top, filters as you type, and still accepts any branch
+name you write — including one this clone hasn't fetched. It defaults to the
+worktree's `base_ref` when the remote still has it and to the remote's default
+branch (`origin/HEAD`) otherwise. Title and description default to the task's;
+both are editable, and the PR can be opened as a draft.
+
+Order of operations, and the refusals (all 409s the UI explains):
+
+| Situation | What happens |
+| --- | --- |
+| Worktree has uncommitted changes | Committed on the branch first, same rule as merging |
+| Branch has no commits of its own | Refused (`nothing_to_push`) |
+| No `gh` / no credential / no remote | Refused (`gh_missing`, `gh_unauthenticated`, `no_remote`) |
+| The push fails (diverged remote branch, no access) | Refused (`push_failed`) with git's own output |
+| The branch already has an open PR | The push updates it; the existing PR is reported back |
+
+Nothing is force-pushed and nothing is merged: the branch, the worktree and
+the task's status are left exactly as they were, minus the leftovers commit.
+
 ## Where it's recorded
 
-`worktrees.merged_at`, `merge_commit` and `merge_target_branch` (migration
-007). Once merged, the worktree's status becomes `retained` — still on disk,
-no longer the live workspace.
+A merge writes `worktrees.merged_at`, `merge_commit` and
+`merge_target_branch` (migration 007), and the worktree's status becomes
+`retained` — still on disk, no longer the live workspace.
+
+A pull request writes `worktrees.pr_url`, `pr_number`, `pr_base_branch` and
+`pr_opened_at` (migration 008) and deliberately leaves the status alone: the
+branch hasn't landed anywhere yet, and more commits may well be pushed onto
+the same PR. The task list shows a `pr #n` badge in place of `unmerged` once
+one is open.
 
 ## API
 
-- `GET /api/worktrees/:id/changes` → `{ worktree, files, stat, merge }`, where
-  `merge` carries the target branch, cleanliness of both sides, the branch's
-  commits, whether it is already merged, and how far the target has moved
-  since the worktree was created.
+- `GET /api/worktrees/:id/changes` → `{ worktree, files, stat, merge, pullRequest }`,
+  where `merge` carries the target branch, cleanliness of both sides, the
+  branch's commits, whether it is already merged, and how far the target has
+  moved since the worktree was created; and `pullRequest` carries the remote,
+  its branches (suggestions, capped at 500 and flagged with
+  `baseCandidatesTruncated`), the default base, whether the branch is already
+  pushed, and whether `gh` is installed and holds a credential.
 - `POST /api/worktrees/:id/merge` with `{ mode?, message?, removeWorktree? }`.
+- `POST /api/worktrees/:id/pull-request` with `{ base?, title?, body?, draft? }`.
 - `POST /api/worktrees/:id/discard` is still the "throw it away" path.

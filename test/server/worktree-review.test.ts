@@ -237,3 +237,121 @@ describe("POST /api/worktrees/:id/merge", () => {
     );
   });
 });
+
+describe("POST /api/worktrees/:id/pull-request", () => {
+  let remotePath: string;
+  let binDir: string;
+  let originalPath: string | undefined;
+
+  /** A `gh` that records its argv and answers the two subcommands this path uses. */
+  function fakeGh(options: { authenticated?: boolean } = {}): void {
+    writeFileSync(
+      path.join(binDir, "gh"),
+      `#!/bin/sh
+printf '%s\\n' "$*" >> "$GH_LOG"
+case "$1" in
+  --version) echo "gh version 0.0.0-fake"; exit 0 ;;
+  auth) ${options.authenticated === false ? "exit 1" : 'echo "fake-token"; exit 0'} ;;
+esac
+case "$2" in
+  list) echo '[]'; exit 0 ;;
+  create) echo "https://github.com/acme/widgets/pull/12"; exit 0 ;;
+esac
+exit 1
+`,
+      { mode: 0o755 }
+    );
+  }
+
+  beforeEach(() => {
+    remotePath = path.join(base, "remote.git");
+    binDir = path.join(base, "bin");
+    mkdirSync(binDir, { recursive: true });
+    git(["init", "-q", "--bare", remotePath], base);
+    git(["remote", "add", "origin", remotePath], repoPath);
+    git(["push", "-q", "-u", "origin", mainBranch], repoPath);
+
+    originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+    process.env.GH_LOG = path.join(base, "gh-calls.log");
+    fakeGh();
+  });
+
+  afterEach(() => {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    delete process.env.GH_LOG;
+  });
+
+  it("pushes the branch, opens the pull request and records it on the worktree", async () => {
+    const wt = await implementedWorktree();
+
+    const res = await server.app.inject({
+      method: "POST",
+      url: `/api/worktrees/${wt.id}/pull-request`,
+      headers: auth,
+      payload: {},
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.url).toBe("https://github.com/acme/widgets/pull/12");
+    expect(body.number).toBe(12);
+    expect(body.base).toBe(mainBranch);
+    expect(body.alreadyExisted).toBe(false);
+
+    // The branch is on the remote, including the file the agent never committed.
+    const pushed = git(["rev-parse", `refs/heads/${wt.branch}`], remotePath);
+    expect(git(["show", `${pushed}:notes.md`], remotePath)).toBe("still uncommitted");
+
+    const row = getWorktree(db, wt.id)!;
+    expect(row.pr_url).toBe(body.url);
+    expect(row.pr_number).toBe(12);
+    expect(row.pr_base_branch).toBe(mainBranch);
+    expect(row.pr_opened_at).not.toBeNull();
+    // Nothing landed locally: this path never touches the main checkout.
+    expect(existsSync(path.join(repoPath, "subtract.ts"))).toBe(false);
+    expect(row.merged_at).toBeNull();
+    expect(row.status).toBe("active");
+
+    // The default title is the task's, same rule as the merge message.
+    const calls = readFileSync(process.env.GH_LOG!, "utf8");
+    expect(calls).toContain("pr create --base");
+    expect(calls).toContain("add subtract");
+  });
+
+  it("stays available when the main checkout is dirty, unlike merging", async () => {
+    const wt = await implementedWorktree();
+    writeFileSync(path.join(repoPath, "README.md"), "my own edit\n");
+
+    const res = await server.app.inject({
+      method: "POST",
+      url: `/api/worktrees/${wt.id}/pull-request`,
+      headers: auth,
+      payload: { base: mainBranch, title: "Custom title", draft: true },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().draft).toBe(true);
+    expect(readFileSync(path.join(repoPath, "README.md"), "utf8")).toBe("my own edit\n");
+    const calls = readFileSync(process.env.GH_LOG!, "utf8");
+    expect(calls).toContain("--title Custom title");
+    expect(calls).toContain("--draft");
+  });
+
+  it("refuses with 409 when gh has no credentials", async () => {
+    const wt = await implementedWorktree();
+    fakeGh({ authenticated: false });
+
+    const res = await server.app.inject({
+      method: "POST",
+      url: `/api/worktrees/${wt.id}/pull-request`,
+      headers: auth,
+      payload: {},
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().code).toBe("gh_unauthenticated");
+    expect(getWorktree(db, wt.id)?.pr_url).toBeNull();
+  });
+});

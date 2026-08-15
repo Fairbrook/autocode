@@ -116,6 +116,24 @@ export function markWorktreeMerged(
   ).run(nowIso(), result.mergeCommit, result.targetBranch, id);
 }
 
+/**
+ * Records that this worktree's branch was pushed and proposed as a pull
+ * request. Unlike a merge the status is left alone: the branch has not landed
+ * anywhere yet, the worktree is still the live workspace for the task, and
+ * more commits may well be pushed onto the same PR.
+ */
+export function markWorktreePrOpened(
+  db: Db,
+  id: number,
+  result: { url: string; number: number | null; base: string }
+): void {
+  db.prepare(
+    `UPDATE worktrees
+        SET pr_url = ?, pr_number = ?, pr_base_branch = ?, pr_opened_at = ?
+      WHERE id = ?`
+  ).run(result.url, result.number, result.base, nowIso(), id);
+}
+
 /** Worktrees whose setup was still 'running' when the process died — used by boot reconciliation. */
 export function listWorktreesBySetupStatus(
   db: Db,

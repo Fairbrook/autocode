@@ -28,6 +28,7 @@ import {
   listWorktreesForTask,
   markWorktreeSetupFinished,
   markWorktreeMerged,
+  markWorktreePrOpened,
   listWorktreesBySetupStatus,
 } from "../db/repo/worktrees.ts";
 import { listPendingApprovals } from "../db/repo/approvals.ts";
@@ -44,6 +45,11 @@ import {
   MergeBlockedError,
   type MergeMode,
 } from "../worktree/review.ts";
+import {
+  getPullRequestState,
+  openPullRequest,
+  PullRequestBlockedError,
+} from "../worktree/pull-request.ts";
 import { runImplementationPipeline, type RunAgent } from "./implement.ts";
 import { registerAuth } from "./auth.ts";
 import { countUsers } from "../db/repo/users.ts";
@@ -212,6 +218,17 @@ export async function buildServer(options: BuildServerOptions = {}) {
         model: config.models.planner,
         maxTurns: config.budgets.plannerMaxTurns,
         maxBudgetUsd: config.budgets.plannerMaxBudgetUsd,
+        // Same human-in-the-loop path the implementation run gets, so the
+        // planner can ask the user a question before committing to an
+        // approach instead of guessing and putting the guess in the plan.
+        makeCanUseTool: (runId) =>
+          createLiveCanUseTool({
+            db,
+            runId,
+            pendingTimeoutMs: config.approvals.pendingTimeoutMs,
+            fanout,
+            localServiceHosts: JSON.parse(project.local_service_hosts || "[]") as string[],
+          }),
       })
         .then((outcome) => {
           if (outcome.ok && outcome.plan) {
@@ -507,6 +524,13 @@ export async function buildServer(options: BuildServerOptions = {}) {
         branch: wt.branch,
         baseSha: wt.base_sha,
       }),
+      pullRequest: getPullRequestState({
+        repoPath: wt.repo_path,
+        worktreePath: wt.worktree_path,
+        branch: wt.branch,
+        baseRef: wt.base_ref,
+        baseSha: wt.base_sha,
+      }),
     };
   });
 
@@ -578,6 +602,80 @@ export async function buildServer(options: BuildServerOptions = {}) {
     return { ok: true, ...result, removed, worktree: getWorktree(db, wt.id) };
   });
 
+  /**
+   * The other way to land a worktree: push the branch and open a pull request
+   * against the remote. Unlike the merge endpoint this never touches the main
+   * checkout, so it stays available when that checkout is dirty — but it does
+   * publish the branch, which is why the UI confirms before calling it.
+   */
+  app.post<{
+    Params: { id: string };
+    Body?: { base?: string; title?: string; body?: string; draft?: boolean };
+  }>("/api/worktrees/:id/pull-request", async (req, reply) => {
+    const wt = getWorktree(db, Number(req.params.id));
+    if (!wt) return reply.code(404).send({ error: "worktree not found" });
+    const task = getTask(db, wt.task_id);
+    const body = req.body ?? {};
+
+    const base =
+      body.base?.trim() ||
+      getPullRequestState({
+        repoPath: wt.repo_path,
+        worktreePath: wt.worktree_path,
+        branch: wt.branch,
+        baseRef: wt.base_ref,
+        baseSha: wt.base_sha,
+      }).defaultBase;
+    if (!base) {
+      return reply
+        .code(409)
+        .send({ error: "No base branch to open the pull request against.", code: "no_remote" });
+    }
+
+    const title = body.title?.trim() || task?.title || `autocode task #${wt.task_id}`;
+    const prBody =
+      body.body?.trim() ||
+      `${task?.description ?? ""}\n\n---\nOpened by autocode from task #${wt.task_id}.`.trim();
+
+    let result;
+    try {
+      result = openPullRequest({
+        repoPath: wt.repo_path,
+        worktreePath: wt.worktree_path,
+        branch: wt.branch,
+        baseSha: wt.base_sha,
+        base,
+        title,
+        body: prBody,
+        draft: Boolean(body.draft),
+        commitMessage: title,
+      });
+    } catch (err) {
+      if (err instanceof PullRequestBlockedError) {
+        app.log.warn(
+          { worktreeId: wt.id, code: err.code },
+          `pull request refused: ${err.message}`
+        );
+        return reply.code(409).send({ error: err.message, code: err.code, ...err.details });
+      }
+      throw err;
+    }
+
+    markWorktreePrOpened(db, wt.id, {
+      url: result.url,
+      number: result.number,
+      base: result.base,
+    });
+
+    app.log.info(
+      { worktreeId: wt.id, branch: wt.branch, base: result.base, url: result.url },
+      result.alreadyExisted
+        ? "pushed to a branch that already had an open pull request"
+        : "pull request opened for worktree branch"
+    );
+    return { ok: true, ...result, worktree: getWorktree(db, wt.id) };
+  });
+
   app.post<{ Params: { id: string } }>("/api/worktrees/:id/discard", async (req, reply) => {
     const wt = getWorktree(db, Number(req.params.id));
     if (!wt) return reply.code(404).send({ error: "worktree not found" });
@@ -600,12 +698,21 @@ export async function buildServer(options: BuildServerOptions = {}) {
   });
   app.post<{
     Params: { id: string };
-    Body: { decision: "allow" | "deny"; rememberScope?: "once" | "run" | "plan"; note?: string };
+    Body: {
+      decision: "allow" | "deny";
+      rememberScope?: "once" | "run" | "plan";
+      note?: string;
+      /** AskUserQuestion only: question text → the chosen option's label. */
+      answers?: Record<string, string>;
+    };
   }>("/api/approvals/:id/resolve", async (req, reply) => {
     const ok = resolvePendingApproval(Number(req.params.id), {
       decision: req.body.decision,
       rememberScope: req.body.rememberScope ?? "once",
       note: req.body.note,
+      // Shape only — which answers actually belong to this call is decided
+      // against the questions the tool asked (see src/server/approvals.ts).
+      answers: plainStringMap(req.body.answers),
     });
     if (!ok) return reply.code(404).send({ error: "no pending approval with that id (already resolved or expired)" });
     return { ok: true };
@@ -634,6 +741,21 @@ export async function buildServer(options: BuildServerOptions = {}) {
   });
 
   return { app, db, config, expiredApprovals };
+}
+
+/**
+ * Narrows an untrusted request field to `{ [string]: string }`, dropping
+ * everything else. What eventually reaches the agent is decided further in
+ * (against the questions it actually asked); this only keeps a nested or
+ * non-string body from getting that far.
+ */
+function plainStringMap(value: unknown): Record<string, string> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry === "string") out[key] = entry;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**

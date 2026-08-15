@@ -22,6 +22,11 @@ function badge(status) {
 function unmergedBadge(task, worktree) {
   if (task.status !== "done" || !worktree) return "";
   if (worktree.merged_at || worktree.status === "removed") return "";
+  // A pull request is the same gap — the branch hasn't landed — but it is
+  // waiting on a review somewhere else, not on the user noticing it here.
+  if (worktree.pr_url) {
+    return `<span class="badge pr-open" title="${esc(worktree.pr_url)}">pr ${esc(worktree.pr_number ? `#${worktree.pr_number}` : "open")}</span>`;
+  }
   return `<span class="badge unmerged" title="The implementation finished but ${esc(worktree.branch)} has not been merged yet">unmerged</span>`;
 }
 
@@ -276,6 +281,7 @@ async function renderTask(taskId, requestedStep) {
 
   // runs are ordered newest-first, so this is the current attempt.
   const implRun = runs.find((r) => r.phase === "implementation") ?? null;
+  const planRun = runs.find((r) => r.phase === "planning") ?? null;
   // Detail carries the pieces the task endpoint doesn't: the agent's task
   // list and the worktree's setup state.
   const detail = implRun ? await api.getRun(implRun.id) : null;
@@ -288,9 +294,13 @@ async function renderTask(taskId, requestedStep) {
     plan,
     planSteps: plan ? JSON.parse(plan.steps_json) : [],
     implRun,
+    planRun,
     detail,
     worktree: detail?.worktree ?? null,
     live,
+    // The planner can stop to ask a question, so the plan step needs the same
+    // live channel the implementation step has.
+    planLive: Boolean(planRun && (planRun.status === "running" || planRun.status === "queued")),
   };
   // Whether this render will attach the SSE stream. Panes that the stream
   // fills (the run log, the setup output) must not also render their stored
@@ -467,8 +477,15 @@ function wireStep(ctx) {
     wireLiveRun(implRun.id, ctx);
   }
 
+  // A planner that stopped to ask something is blocked until it's answered,
+  // so the plan step watches its run for approval requests — and follows the
+  // task on to the finished plan when the run ends.
+  if (step === "plan" && ctx.planLive && ctx.planRun) {
+    wireLiveRun(ctx.planRun.id, ctx);
+  }
+
   if (step === "review" && ctx.worktree && !ctx.live && ctx.worktree.status !== "removed") {
-    wireReview(ctx.worktree);
+    wireReview(ctx.worktree, ctx.task);
   }
 }
 
@@ -477,7 +494,12 @@ function renderPlanStep(ctx) {
   const { plan, task, runs } = ctx;
   if (!plan) {
     if (task.status === "failed") return renderFailure(runs.find((r) => r.phase === "planning"));
-    return `<div class="card"><p class="muted">Planning in progress…</p></div>`;
+    return `
+      <div class="card">
+        <p class="muted">Planning in progress…</p>
+      </div>
+      <div id="approvals-area"></div>
+    `;
   }
   if (plan.status === "pending") return renderPlanReview(plan);
 
@@ -626,6 +648,9 @@ function renderWorktreeCard(worktree) {
         <dt>Base</dt><dd>${esc(worktree.base_ref)} @ ${esc((worktree.base_sha || "").slice(0, 8))}</dd>
         ${worktree.merged_at
           ? `<dt>Merged</dt><dd>into ${esc(worktree.merge_target_branch || "?")} at ${esc((worktree.merge_commit || "").slice(0, 8))}</dd>`
+          : ""}
+        ${worktree.pr_url
+          ? `<dt>Pull request</dt><dd><a href="${esc(worktree.pr_url)}" target="_blank" rel="noreferrer">${esc(worktree.pr_number ? `#${worktree.pr_number}` : worktree.pr_url)}</a> → ${esc(worktree.pr_base_branch || "?")}</dd>`
           : ""}
       </dl>
     </div>
@@ -1054,6 +1079,160 @@ function summarize(kind, payload) {
   return JSON.stringify(payload).slice(0, 200);
 }
 
+// ---------- Approvals ----------
+
+/**
+ * The agent's multiple-choice question tool. It reaches the same approval path
+ * as any other tool, but allow/deny is the wrong answer to it: approving
+ * without picking an option leaves the agent to choose for itself, which is
+ * exactly what it asked not to do. The options are rendered as a form and the
+ * choice is sent back with the approval.
+ */
+function askedQuestions(approval) {
+  if (approval.tool_name !== "AskUserQuestion") return null;
+  try {
+    const input = JSON.parse(approval.tool_input_json);
+    return Array.isArray(input?.questions) && input.questions.length > 0 ? input.questions : null;
+  } catch {
+    return null;
+  }
+}
+
+function approvalCard(a) {
+  const questions = askedQuestions(a);
+  return questions ? questionCard(a, questions) : toolApprovalCard(a);
+}
+
+function toolApprovalCard(a) {
+  let input = {};
+  try {
+    input = JSON.parse(a.tool_input_json);
+  } catch {
+    // Falls through to the raw text below; a card is more useful than nothing.
+  }
+  return `
+    <div class="approval-card" data-id="${a.id}">
+      <div class="row between">
+        <strong>${esc(a.tool_name)} needs your approval</strong>
+      </div>
+      <div class="command">${esc(input.command || a.tool_input_json)}</div>
+      ${a.reason ? `<div class="reason">${esc(a.reason)}</div>` : ""}
+      <div class="row" style="margin-top:0.5rem">
+        <button class="primary" data-allow="${a.id}">Allow</button>
+        <button class="danger" data-deny="${a.id}">Deny</button>
+      </div>
+    </div>
+  `;
+}
+
+function questionCard(a, questions) {
+  return `
+    <div class="approval-card question-card" data-id="${a.id}" data-question-card="${a.id}">
+      <div class="row between">
+        <strong>The agent is asking${questions.length > 1 ? ` ${questions.length} questions` : ""}</strong>
+      </div>
+      ${questions.map((q, qi) => renderQuestion(a.id, q, qi)).join("")}
+      <div class="row" style="margin-top:0.75rem">
+        <button class="primary" data-send="${a.id}" disabled>
+          Send answer${questions.length > 1 ? "s" : ""}
+        </button>
+        <button class="danger" data-deny="${a.id}">Dismiss</button>
+        <span class="muted" data-answer-hint>Pick an option to answer.</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderQuestion(approvalId, q, qi) {
+  const type = q.multiSelect ? "checkbox" : "radio";
+  const name = `answer-${approvalId}-${qi}`;
+  const options = Array.isArray(q.options) ? q.options : [];
+  return `
+    <div class="question">
+      <div class="question-head">
+        ${q.header ? `<span class="chip">${esc(q.header)}</span>` : ""}
+        <span>${esc(q.question)}</span>
+        ${q.multiSelect ? `<span class="muted">choose any</span>` : ""}
+      </div>
+      ${options.map((o) => `
+        <label class="option">
+          <input type="${type}" name="${name}" data-qi="${qi}" value="${esc(o.label)}" />
+          <span class="option-text">
+            <span class="option-label">${esc(o.label)}</span>
+            ${o.description ? `<span class="option-desc">${esc(o.description)}</span>` : ""}
+          </span>
+        </label>
+        ${o.preview ? `<pre class="option-preview">${esc(o.preview)}</pre>` : ""}
+      `).join("")}
+      <label class="option">
+        <input type="${type}" name="${name}" data-qi="${qi}" value="" data-other-choice="${qi}" />
+        <span class="option-text">
+          <span class="option-label">Something else</span>
+          <input class="option-other" type="text" data-other="${qi}"
+                 placeholder="Answer in your own words" />
+        </span>
+      </label>
+    </div>
+  `;
+}
+
+/**
+ * Collects one answer per question, keyed by the question's own text — the
+ * shape the tool reads them back in. Multi-select answers are comma-separated,
+ * and "Something else" contributes whatever the user typed.
+ */
+function collectAnswers(card, questions) {
+  const answers = {};
+  questions.forEach((q, qi) => {
+    const chosen = [...card.querySelectorAll(`input[data-qi="${qi}"]:checked`)];
+    const other = card.querySelector(`[data-other="${qi}"]`);
+    const values = chosen
+      .map((el) => (el.dataset.otherChoice === undefined ? el.value : (other?.value ?? "").trim()))
+      .filter(Boolean);
+    if (values.length > 0) answers[q.question] = values.join(", ");
+  });
+  return answers;
+}
+
+function wireQuestionCard(approval, onSubmit) {
+  const questions = askedQuestions(approval);
+  if (!questions) return;
+  const card = document.querySelector(`[data-question-card="${approval.id}"]`);
+  if (!card) return;
+  const sendBtn = card.querySelector("[data-send]");
+  const hint = card.querySelector("[data-answer-hint]");
+
+  function sync() {
+    const answers = collectAnswers(card, questions);
+    const answered = Object.keys(answers).length;
+    sendBtn.disabled = answered < questions.length;
+    hint.textContent = sendBtn.disabled
+      ? `${answered}/${questions.length} answered.`
+      : "";
+    return answers;
+  }
+
+  card.addEventListener("change", sync);
+  // Typing in "Something else" is itself the choice: clicking a text field
+  // inside a label doesn't select the label's radio, so it's done here.
+  card.addEventListener("input", (e) => {
+    const qi = e.target.dataset?.other;
+    if (qi !== undefined) {
+      const choice = card.querySelector(`[data-other-choice="${qi}"]`);
+      if (choice) choice.checked = e.target.value.trim() !== "";
+    }
+    sync();
+  });
+
+  sendBtn.addEventListener("click", () => {
+    const answers = sync();
+    if (sendBtn.disabled) return;
+    sendBtn.disabled = true;
+    hint.textContent = "Sending…";
+    onSubmit(answers);
+  });
+}
+
 /**
  * Attaches the run's event stream to whichever panes the current step
  * rendered: the setup step has the install log, the implementation step has
@@ -1095,19 +1274,7 @@ async function wireLiveRun(runId, ctx) {
   async function refreshApprovals() {
     if (!approvalsEl) return;
     const pending = await api.listApprovals(runId);
-    approvalsEl.innerHTML = pending.map((a) => `
-      <div class="approval-card" data-id="${a.id}">
-        <div class="row between">
-          <strong>${esc(a.tool_name)} needs your approval</strong>
-        </div>
-        <div class="command">${esc(JSON.parse(a.tool_input_json).command || JSON.stringify(JSON.parse(a.tool_input_json)))}</div>
-        ${a.reason ? `<div class="reason">${esc(a.reason)}</div>` : ""}
-        <div class="row" style="margin-top:0.5rem">
-          <button class="primary" data-allow="${a.id}">Allow</button>
-          <button class="danger" data-deny="${a.id}">Deny</button>
-        </div>
-      </div>
-    `).join("");
+    approvalsEl.innerHTML = pending.map(approvalCard).join("");
 
     approvalsEl.querySelectorAll("[data-allow]").forEach((btn) =>
       btn.addEventListener("click", () => resolveApproval(btn.dataset.allow, "allow"))
@@ -1115,11 +1282,19 @@ async function wireLiveRun(runId, ctx) {
     approvalsEl.querySelectorAll("[data-deny]").forEach((btn) =>
       btn.addEventListener("click", () => resolveApproval(btn.dataset.deny, "deny"))
     );
+    pending.forEach((a) => wireQuestionCard(a, (answers) => resolveApproval(a.id, "allow", answers)));
   }
 
-  async function resolveApproval(id, decision) {
-    const note = decision === "deny" ? prompt("Optional note for why you're denying this:") ?? "" : "";
-    await api.resolveApproval(id, { decision, note });
+  async function resolveApproval(id, decision, answers) {
+    const note =
+      decision === "deny" ? (prompt("Optional note for why you're denying this:") ?? "").trim() : "";
+    // An empty note is no note: sending one would shadow the defaults the
+    // server fills in (the answer summary, or "Denied by user").
+    await api.resolveApproval(id, {
+      decision,
+      ...(note ? { note } : {}),
+      ...(answers ? { answers } : {}),
+    });
     refreshApprovals();
   }
 
@@ -1176,7 +1351,7 @@ function reviewCardShell(worktree) {
   `;
 }
 
-async function wireReview(worktree) {
+async function wireReview(worktree, task) {
   const bodyEl = document.getElementById("review-body");
   const loadingEl = document.getElementById("review-loading");
   if (!bodyEl) return;
@@ -1191,9 +1366,9 @@ async function wireReview(worktree) {
   }
   loadingEl.remove();
 
-  const { files, stat, merge } = changes;
+  const { files, stat, merge, pullRequest } = changes;
   bodyEl.innerHTML = `
-    ${renderMergePanel(worktree, merge, files)}
+    ${renderLandPanel(worktree, merge, pullRequest, files, task)}
     ${files.length === 0
       ? `<p class="muted">No changes against <code>${esc(worktree.base_ref)}</code>.</p>`
       : `
@@ -1226,7 +1401,7 @@ async function wireReview(worktree) {
     select(0);
   }
 
-  wireMergeControls(worktree, merge);
+  wireLandPanel(worktree, merge, pullRequest);
 }
 
 const STATUS_MARK = {
@@ -1314,7 +1489,62 @@ function diffRow(kind, oldNo, newNo, text) {
   return `<div class="diff-line ${kind}"><span class="ln">${oldNo}</span><span class="ln">${newNo}</span><code>${esc(text)}</code></div>`;
 }
 
-function renderMergePanel(worktree, merge, files) {
+/**
+ * Two ways to land the branch, side by side: merge it into the main checkout,
+ * or push it and open a pull request. They are mutually exclusive in practice
+ * but not in principle (a merged branch can still have a PR open against a
+ * remote), so both stay reachable and each explains its own blockers.
+ *
+ * The tab that opens is the one that can actually be used: a dirty main
+ * checkout blocks the merge but not a push, and once a PR exists it's the
+ * thing the user came back to look at.
+ */
+function renderLandPanel(worktree, merge, pullRequest, files, task) {
+  const mergeSection = renderMergeSection(worktree, merge, files);
+  const prSection = renderPrSection(worktree, pullRequest, merge, task);
+  // A branch that already landed locally has nothing to propose, so a blocked
+  // merge tab there is the end of the story rather than a reason to switch.
+  const initial =
+    worktree.pr_url ||
+    (mergeSection.blocked && !prSection.blocked && !worktree.merged_at)
+      ? "pr"
+      : "merge";
+
+  return `
+    <div class="merge-bar">
+      <div class="land-tabs" role="tablist">
+        <button class="land-tab ${initial === "merge" ? "active" : ""}" data-land="merge" role="tab">
+          Merge locally
+        </button>
+        <button class="land-tab ${initial === "pr" ? "active" : ""}" data-land="pr" role="tab">
+          Open a pull request
+        </button>
+      </div>
+      <div class="land-panel" data-land-panel="merge" ${initial === "merge" ? "" : "hidden"}>
+        ${mergeSection.html}
+      </div>
+      <div class="land-panel" data-land-panel="pr" ${initial === "pr" ? "" : "hidden"}>
+        ${prSection.html}
+      </div>
+    </div>
+  `;
+}
+
+function wireLandPanel(worktree, merge, pullRequest) {
+  const tabs = document.querySelectorAll(".land-tab");
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      tabs.forEach((t) => t.classList.toggle("active", t === tab));
+      document.querySelectorAll("[data-land-panel]").forEach((panel) => {
+        panel.hidden = panel.dataset.landPanel !== tab.dataset.land;
+      });
+    });
+  });
+  wireMergeControls(worktree, merge);
+  wirePrControls(worktree, pullRequest);
+}
+
+function renderMergeSection(worktree, merge, files) {
   const target = merge.targetBranch;
   const notes = [];
   let blocked = null;
@@ -1343,8 +1573,9 @@ function renderMergePanel(worktree, merge, files) {
     ? `<div class="muted">${merge.commits.length} commit${merge.commits.length === 1 ? "" : "s"} on this branch: ${esc(merge.commits.map((c) => c.subject).slice(0, 3).join(" · "))}${merge.commits.length > 3 ? " …" : ""}</div>`
     : `<div class="muted">No commits on this branch yet.</div>`;
 
-  return `
-    <div class="merge-bar">
+  return {
+    blocked,
+    html: `
       <div class="row between">
         <div>
           <strong>Merge <code>${esc(worktree.branch)}</code> into <code>${esc(target || "—")}</code></strong>
@@ -1366,8 +1597,130 @@ function renderMergePanel(worktree, merge, files) {
       <input id="merge-message" placeholder="Defaults to the task title" />
       <label class="inline"><input type="checkbox" id="merge-remove" /> Remove the worktree after merging</label>
       <div id="merge-status" class="muted"></div>
-    </div>
-  `;
+    `,
+  };
+}
+
+/**
+ * The pull-request half of the panel. Everything it needs to know came with
+ * the diff (`pullRequest` in the changes payload) and is local git state, so
+ * nothing here has hit the network yet — the first call to GitHub happens when
+ * the user presses the button.
+ */
+function renderPrSection(worktree, pr, merge, task) {
+  const notes = [];
+  let blocked = null;
+
+  if (worktree.pr_url) {
+    notes.push(`<div class="merge-note ok">Pull request <a href="${esc(worktree.pr_url)}" target="_blank" rel="noreferrer">${esc(worktree.pr_number ? `#${worktree.pr_number}` : "open")}</a> against <code>${esc(worktree.pr_base_branch || "?")}</code>, opened ${new Date(worktree.pr_opened_at).toLocaleString()}. Opening again pushes the branch's new commits to it.</div>`);
+  }
+
+  if (!pr.ghAvailable) {
+    blocked = "The GitHub CLI (<code>gh</code>) isn't on the server's PATH — autocode uses it so it never has to hold a token of its own.";
+  } else if (!pr.ghAuthenticated) {
+    blocked = "The GitHub CLI has no credentials. Run <code>gh auth login</code> (or set <code>GH_TOKEN</code>) as the user running autocode.";
+  } else if (!pr.remote) {
+    blocked = `<code>${esc(worktree.repo_path)}</code> has no git remote to push to.`;
+  } else if (pr.baseCandidates.length === 0) {
+    blocked = `No branches on <code>${esc(pr.remote)}</code> to target — push the base branch first.`;
+  } else if (pr.commitCount === 0 && !merge.worktreeDirty) {
+    blocked = `<code>${esc(worktree.branch)}</code> has no commits of its own — there is nothing to propose.`;
+  }
+
+  if (merge.worktreeDirty) {
+    notes.push(`<div class="merge-note">${merge.worktreeDirtyFiles.length} uncommitted file${merge.worktreeDirtyFiles.length === 1 ? "" : "s"} in the worktree will be committed on <code>${esc(worktree.branch)}</code> before the push.</div>`);
+  }
+  if (pr.pushed && !pr.pushUpToDate) {
+    notes.push(`<div class="merge-note"><code>${esc(pr.remote)}/${esc(worktree.branch)}</code> already exists and is behind the worktree — the push will add the newer commits.</div>`);
+  }
+  if (!blocked && pr.baseCandidates.length > 0) {
+    // The base field is a datalist, which looks like a plain text box until
+    // you type — worth saying that it searches, and that it isn't limited to
+    // what's listed.
+    notes.push(`<div class="merge-note">Type in the base field to search ${pr.baseCandidates.length} branch${pr.baseCandidates.length === 1 ? "" : "es"} on <code>${esc(pr.remote)}</code>${pr.baseCandidatesTruncated ? " (the busiest ones)" : ""} — or type any branch name the remote has.</div>`);
+  }
+
+  const commits = pr.commitCount
+    ? `<div class="muted">${pr.commitCount} commit${pr.commitCount === 1 ? "" : "s"} to push${pr.remote ? ` to <code>${esc(pr.remoteUrl || pr.remote)}</code>` : ""}.</div>`
+    : `<div class="muted">Nothing committed on this branch yet.</div>`;
+
+  return {
+    blocked,
+    html: `
+      <div class="row between">
+        <div>
+          <strong>Push <code>${esc(worktree.branch)}</code> and open a pull request</strong>
+          ${commits}
+        </div>
+        <div class="row">
+          <label class="base-field">
+            <span class="muted">Base</span>
+            <input id="pr-base" class="base-input" list="pr-base-options" type="text"
+                   value="${esc(pr.defaultBase || "")}"
+                   placeholder="Branch to merge into"
+                   autocomplete="off" spellcheck="false" ${blocked ? "disabled" : ""} />
+          </label>
+          <datalist id="pr-base-options">
+            ${pr.baseCandidates.map((b) => `<option value="${esc(b)}"></option>`).join("")}
+          </datalist>
+          <button class="primary" id="do-pr" ${blocked ? "disabled" : ""}>
+            ${worktree.pr_url ? "Push to the pull request" : "Open pull request"}
+          </button>
+        </div>
+      </div>
+      ${blocked ? `<div class="merge-note blocked">${blocked}</div>` : ""}
+      ${notes.join("")}
+      <label for="pr-title">Title <span class="muted">(optional)</span></label>
+      <input id="pr-title" placeholder="${esc(task?.title || "Defaults to the task title")}" />
+      <label for="pr-body">Description <span class="muted">(optional)</span></label>
+      <textarea id="pr-body" placeholder="Defaults to the task description."></textarea>
+      <label class="inline"><input type="checkbox" id="pr-draft" /> Open as a draft</label>
+      <div id="pr-status" class="muted"></div>
+    `,
+  };
+}
+
+function wirePrControls(worktree, pr) {
+  const btn = document.getElementById("do-pr");
+  const statusEl = document.getElementById("pr-status");
+  if (!btn || btn.disabled) return;
+
+  btn.addEventListener("click", async () => {
+    const base = document.getElementById("pr-base").value.trim();
+    if (!base) {
+      statusEl.className = "error-text";
+      statusEl.textContent = "Name the branch to open the pull request against.";
+      return;
+    }
+    const title = document.getElementById("pr-title").value.trim();
+    const body = document.getElementById("pr-body").value.trim();
+    const draft = document.getElementById("pr-draft").checked;
+    // Pushing publishes the branch to a remote other people can see, so it
+    // gets the same confirmation the merge does.
+    if (!confirm(`Push ${worktree.branch} to ${pr.remote} and open a pull request against ${base}?`)) {
+      return;
+    }
+    btn.disabled = true;
+    statusEl.className = "muted";
+    statusEl.textContent = "Pushing and opening the pull request…";
+    try {
+      const result = await api.openPullRequest(worktree.id, {
+        base,
+        draft,
+        ...(title ? { title } : {}),
+        ...(body ? { body } : {}),
+      });
+      statusEl.className = "muted";
+      statusEl.innerHTML = `${result.alreadyExisted ? "Pushed to the existing pull request" : "Opened"} <a href="${esc(result.url)}" target="_blank" rel="noreferrer">${esc(result.number ? `#${result.number}` : result.url)}</a> against ${esc(result.base)}.`;
+      setTimeout(() => router(), 1200);
+    } catch (err) {
+      statusEl.className = "error-text";
+      const output = err.data?.output;
+      statusEl.innerHTML =
+        esc(err.message) + (output ? `<div class="merge-files">${esc(output)}</div>` : "");
+      btn.disabled = false;
+    }
+  });
 }
 
 function wireMergeControls(worktree, merge) {

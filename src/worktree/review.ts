@@ -16,7 +16,7 @@ const MAX_BUFFER = 128 * 1024 * 1024;
 /** The branch's own commits are listed for context, not paginated. */
 const MAX_COMMITS = 50;
 
-function git(args: string[], cwd: string): string {
+export function git(args: string[], cwd: string): string {
   return raw(args, cwd).trim();
 }
 
@@ -40,7 +40,7 @@ function rawAllowingDiffExit(args: string[], cwd: string): string {
 }
 
 /** Runs a git predicate command (`merge-base --is-ancestor`, …) and returns its exit code. */
-function exitCode(args: string[], cwd: string): number {
+export function exitCode(args: string[], cwd: string): number {
   try {
     execFileSync("git", args, { cwd, stdio: "ignore" });
     return 0;
@@ -419,9 +419,10 @@ export function mergeWorktree(input: {
 /**
  * Commits whatever the agent left uncommitted in the worktree, including
  * untracked files. Without this the review pane would show changes that the
- * merge then silently leaves behind.
+ * merge then silently leaves behind. Shared with the pull-request path, which
+ * has the same problem: an unpushed change is an invisible one.
  */
-function commitLeftovers(
+export function commitLeftovers(
   worktreePath: string,
   message: string
 ): { sha: string; message: string } | null {

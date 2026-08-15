@@ -50,6 +50,8 @@ export const api = {
   /** Per-file diff of the whole branch + whether it can be merged right now. */
   getWorktreeChanges: (id) => request("GET", `/api/worktrees/${id}/changes`),
   mergeWorktree: (id, body) => request("POST", `/api/worktrees/${id}/merge`, body),
+  /** Pushes the branch and opens a pull request instead of merging locally. */
+  openPullRequest: (id, body) => request("POST", `/api/worktrees/${id}/pull-request`, body),
   discardWorktree: (id) => request("POST", `/api/worktrees/${id}/discard`),
 
   listApprovals: (runId) => request("GET", `/api/approvals${runId ? `?runId=${runId}` : ""}`),

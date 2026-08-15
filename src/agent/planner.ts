@@ -1,3 +1,4 @@
+import type { CanUseTool } from "@anthropic-ai/claude-agent-sdk";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +23,17 @@ export interface RunPlannerInput {
   model: string;
   maxTurns: number;
   maxBudgetUsd: number;
+  /**
+   * Built per run rather than passed ready-made: the run row this planner
+   * writes to is created below, and an approval has to be filed against it to
+   * be answerable from the task page.
+   *
+   * Planning is read-only and its Bash calls are auto-allowed by the sandbox,
+   * so in practice the only thing that reaches this callback is the agent
+   * asking the user a question (AskUserQuestion) — which it could not do at
+   * all while the planner had no permission callback.
+   */
+  makeCanUseTool?: (runId: number) => CanUseTool;
 }
 
 export interface PlannerOutcome {
@@ -47,6 +59,8 @@ export async function runPlanner(input: RunPlannerInput): Promise<PlannerOutcome
     cwd: project.repo_path,
   });
 
+  const canUseTool = input.makeCanUseTool?.(run.id);
+
   const prompt = `${PLANNER_SYSTEM_PROMPT}\n\n---\n\nTask description from the user:\n\n${task.description}`;
 
   const result = await runSession({
@@ -60,6 +74,7 @@ export async function runPlanner(input: RunPlannerInput): Promise<PlannerOutcome
     maxBudgetUsd: input.maxBudgetUsd,
     permissionMode: "plan",
     disallowedTools: ["Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch"],
+    ...(canUseTool ? { canUseTool } : {}),
     outputFormat: { type: "json_schema", schema: PlanOutputJsonSchema },
     settingSources: ["project"],
   });
