@@ -144,6 +144,24 @@ th { color: var(--muted); font-weight: 600; }
 .approval-card .command { font-family: var(--mono); font-size: 0.85rem; background: var(--bg); padding: 0.4rem 0.6rem; border-radius: 4px; margin: 0.4rem 0; }
 .approval-card .reason { font-size: 0.85rem; color: var(--muted); }
 
+/* ---- Unattended mode ---- */
+.unattended-card {
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+}
+/* Solid and warn-coloured while it's on: nobody should have to read the card
+   to notice that approvals are being answered for them. */
+.unattended-card.on {
+  border: 1px solid var(--warn);
+  border-style: solid;
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+.unattended-card .muted { font-size: 0.85rem; max-width: 60ch; }
+.unattended-card .row.between { gap: 1rem; align-items: flex-start; }
+.unattended-card button { flex: none; }
+
 /* ---- The agent's multiple-choice question (AskUserQuestion) ---- */
 .question-card { border-color: var(--accent); }
 .question + .question { border-top: 1px solid var(--border); padding-top: 0.75rem; margin-top: 0.75rem; }

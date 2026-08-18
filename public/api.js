@@ -43,6 +43,8 @@ export const api = {
   implementPlan: (id) => request("POST", `/api/plans/${id}/implement`),
 
   getRun: (id) => request("GET", `/api/runs/${id}`),
+  /** Auto-allow every tool call this run would otherwise stop to ask about. */
+  setRunUnattended: (id, enabled) => request("POST", `/api/runs/${id}/unattended`, { enabled }),
   listMetrics: () => request("GET", "/api/metrics"),
 
   listWorktrees: () => request("GET", "/api/worktrees"),
@@ -74,6 +76,7 @@ export function streamRunEvents(runId, onEvent) {
     "background_tasks_changed",
     "approval_request",
     "approval_resolved",
+    "unattended",
     "notification",
     "result",
     "error",

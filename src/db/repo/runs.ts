@@ -76,6 +76,21 @@ export function setRunStatus(
   );
 }
 
+/**
+ * Unattended mode is per run and mutable mid-run: the approval path reads it
+ * on every tool call, so flipping it takes effect on the very next one.
+ */
+export function setRunUnattended(db: Db, id: number, unattended: boolean): void {
+  db.prepare("UPDATE runs SET unattended = ? WHERE id = ?").run(unattended ? 1 : 0, id);
+}
+
+export function isRunUnattended(db: Db, id: number): boolean {
+  const row = db.prepare("SELECT unattended FROM runs WHERE id = ?").get(id) as
+    | { unattended: number }
+    | undefined;
+  return row?.unattended === 1;
+}
+
 export function setRunSdkSessionId(db: Db, id: number, sdkSessionId: string): void {
   db.prepare("UPDATE runs SET sdk_session_id = ? WHERE id = ?").run(
     sdkSessionId,

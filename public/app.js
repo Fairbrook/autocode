@@ -555,6 +555,10 @@ function renderSetupStep(ctx) {
            <p class="muted">No setup command is configured for this project, so the agent started straight away.</p>
          </div>`
       : renderSetupCard(worktree, streaming)}
+    <!-- Armed here as well as on the implementation step: a cold install is
+         exactly when the user walks away, and the agent starts asking the
+         moment it ends. -->
+    <div id="unattended-area"></div>
     ${failed ? renderFailure(implRun) : ""}
     ${failed ? renderRetryCard(plan, worktree, "setup") : ""}
   `;
@@ -1019,6 +1023,7 @@ function renderRunView(run, detail, planSteps, streaming) {
       </div>
       <h3>Task list</h3>
       <div id="todo-area">${renderTodoList(detail?.todos, planSteps)}</div>
+      <div id="unattended-area"></div>
       <div id="approvals-area"></div>
       <div id="metrics-area"></div>
       <h3>${streaming ? "Live log" : "Log"}</h3>
@@ -1071,12 +1076,49 @@ function summarize(kind, payload) {
     const done = payload.todos.filter((t) => t.status === "completed").length;
     return `${done}/${payload.todos.length} — ${active ? active.activeForm || active.content : "no item in progress"}`;
   }
+  if (kind === "unattended") {
+    return payload.enabled
+      ? `on — approvals are allowed automatically${payload.released ? ` (${payload.released} pending allowed)` : ""}`
+      : "off — approvals come back to you";
+  }
   if (kind === "setup_status") {
     return payload.status === "running"
       ? `running \`${payload.command}\``
       : `${payload.status}${payload.exitCode != null ? ` (exit ${payload.exitCode})` : ""}${payload.timedOut ? " — timed out" : ""}`;
   }
   return JSON.stringify(payload).slice(0, 200);
+}
+
+// ---------- Unattended ----------
+
+/**
+ * The switch that takes the human out of the loop for the rest of the run:
+ * everything the agent would have stopped to ask about is allowed as it comes
+ * in, and a question it asks is left for it to answer itself.
+ *
+ * What it does *not* touch is worth saying on the card, because "allow
+ * anything" reads wider than it is: a command the rules deny is still denied,
+ * writes are still confined to the worktree, and the sandbox's network
+ * allowlist is unchanged.
+ */
+function unattendedCard(runId, on) {
+  return `
+    <div class="unattended-card${on ? " on" : ""}">
+      <div class="row between">
+        <div>
+          <strong>${on ? "Running unattended" : "Unattended"}</strong>
+          <div class="muted">
+            ${on
+              ? "Approvals are being allowed automatically and the agent answers its own questions. Denied commands, the worktree write roots and the network allowlist still apply."
+              : "Allow whatever the agent asks for from here on, so the run finishes without you."}
+          </div>
+        </div>
+        <button class="${on ? "danger" : "primary"}" data-unattended="${runId}">
+          ${on ? "Take back control" : "Run unattended"}
+        </button>
+      </div>
+    </div>
+  `;
 }
 
 // ---------- Approvals ----------
@@ -1242,6 +1284,7 @@ function wireQuestionCard(approval, onSubmit) {
 async function wireLiveRun(runId, ctx) {
   const logEl = document.getElementById("run-log");
   const approvalsEl = document.getElementById("approvals-area");
+  const unattendedEl = document.getElementById("unattended-area");
   const todoEl = document.getElementById("todo-area");
   const setupLogEl = document.getElementById("setup-log");
   const setupBadgeEl = document.getElementById("setup-badge");
@@ -1271,6 +1314,38 @@ async function wireLiveRun(runId, ctx) {
     if (todoEl) todoEl.innerHTML = renderTodoList(todos, planSteps);
   }
 
+  /**
+   * Re-rendered rather than toggled in place, because the card says something
+   * different in each state. The state itself is the server's: `enabled` comes
+   * either from the call that just succeeded or from the run's own event
+   * stream, so a second tab flipping the switch is reflected here too.
+   */
+  function applyUnattended(enabled) {
+    if (!unattendedEl) return;
+    unattendedEl.innerHTML = unattendedCard(runId, enabled);
+    const btn = unattendedEl.querySelector("[data-unattended]");
+    btn?.addEventListener("click", async () => {
+      const enable = !enabled;
+      if (
+        enable &&
+        !confirm(
+          "Run unattended?\n\nEvery tool call the agent would have stopped to ask you about — this one and every one after it — gets allowed automatically, and it answers its own questions."
+        )
+      ) {
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await api.setRunUnattended(runId, enable);
+        applyUnattended(enable);
+        refreshApprovals();
+      } catch (err) {
+        alert(err.message);
+        btn.disabled = false;
+      }
+    });
+  }
+
   async function refreshApprovals() {
     if (!approvalsEl) return;
     const pending = await api.listApprovals(runId);
@@ -1298,6 +1373,7 @@ async function wireLiveRun(runId, ctx) {
     refreshApprovals();
   }
 
+  applyUnattended(ctx.implRun?.id === runId && ctx.implRun?.unattended === 1);
   await refreshApprovals();
 
   activeStream = streamRunEvents(runId, (kind, payload) => {
@@ -1311,6 +1387,8 @@ async function wireLiveRun(runId, ctx) {
     if (kind === "todos") applyTodos(payload.todos);
     if (kind === "setup_status" && setupBadgeEl) setupBadgeEl.innerHTML = badge(payload.status);
     if (kind === "approval_request" || kind === "approval_resolved") refreshApprovals();
+    // Replayed in order on connect, so the last one carries the current state.
+    if (kind === "unattended") applyUnattended(Boolean(payload.enabled));
     if (kind === "status" && (payload.status === "completed" || payload.status === "failed")) {
       setTimeout(() => router(), 500);
     }

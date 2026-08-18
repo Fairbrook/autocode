@@ -8,7 +8,14 @@ import { openDb, type Db } from "../db/index.ts";
 import type { PlanRow } from "../types.ts";
 import { upsertProjectSeeds, listProjects, createProject, getProject } from "../db/repo/projects.ts";
 import { createTask, getTask, listTasks, setTaskStatus } from "../db/repo/tasks.ts";
-import { listRuns, getRun, listRunsByStatus, setRunStatus, createRun } from "../db/repo/runs.ts";
+import {
+  listRuns,
+  getRun,
+  listRunsByStatus,
+  setRunStatus,
+  createRun,
+  setRunUnattended,
+} from "../db/repo/runs.ts";
 import {
   getPlan,
   getPlanForTask,
@@ -62,6 +69,7 @@ import {
   reconcileOrphanedApprovalsOnBoot,
   createLiveCanUseTool,
   resolvePendingApproval,
+  autoAllowParkedApprovals,
 } from "./approvals.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -492,6 +500,34 @@ export async function buildServer(options: BuildServerOptions = {}) {
       const lastEventId = (req.headers["last-event-id"] as string | undefined) ?? req.query.since;
       reply.hijack();
       sseHandler(db, runId, reply.raw, lastEventId);
+    }
+  );
+
+  /**
+   * Unattended mode: the user says up front that every tool call this run
+   * would have stopped to ask about is allowed, so it can finish while nobody
+   * is watching. It's per run and reversible at any point — the approval path
+   * reads the flag on each call — and turning it on also releases whatever the
+   * agent is blocked on right now, which is usually why the button was
+   * clicked in the first place.
+   *
+   * It removes the human, not the boundary: rules that deny a command, the
+   * worktree write roots and the sandbox's network allowlist all still apply.
+   */
+  app.post<{ Params: { id: string }; Body?: { enabled?: boolean } }>(
+    "/api/runs/:id/unattended",
+    async (req, reply) => {
+      const run = getRun(db, Number(req.params.id));
+      if (!run) return reply.code(404).send({ error: "run not found" });
+      const enabled = req.body?.enabled !== false;
+
+      // Set first, release second: a tool call that arrives between the two
+      // then takes the auto-allow path rather than parking for a user who has
+      // already left.
+      setRunUnattended(db, run.id, enabled);
+      const released = enabled ? autoAllowParkedApprovals(run.id) : 0;
+      appendRunLog(db, run.id, "unattended", { enabled, released });
+      return { ok: true, unattended: enabled, released };
     }
   );
 

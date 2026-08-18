@@ -6,6 +6,7 @@ import {
   expireOrphanedPendingApprovals,
 } from "../db/repo/approvals.ts";
 import { appendRunLog } from "../db/repo/log.ts";
+import { isRunUnattended } from "../db/repo/runs.ts";
 import type { RememberScope } from "../types.ts";
 import type { Fanout } from "../notify/index.ts";
 import { withLocalServiceProxyEnv } from "../filter/proxy-env.ts";
@@ -74,7 +75,15 @@ function summarizeAnswers(answers: Record<string, string>): string {
     .join(" · ");
 }
 
-const pendingResolvers = new Map<number, (res: PendingResolution) => void>();
+interface ParkedApproval {
+  runId: number;
+  resolve: (res: PendingResolution) => void;
+}
+
+const pendingResolvers = new Map<number, ParkedApproval>();
+
+/** The resolution note that marks a decision as the flag's rather than a person's. */
+export const UNATTENDED_NOTE = "Auto-allowed — the run is unattended";
 
 /** Called once at boot: any row still 'pending' belongs to a process lifetime that's gone. */
 export function reconcileOrphanedApprovalsOnBoot(db: Db): number {
@@ -85,11 +94,34 @@ export function resolvePendingApproval(
   approvalId: number,
   resolution: PendingResolution
 ): boolean {
-  const resolver = pendingResolvers.get(approvalId);
-  if (!resolver) return false;
-  resolver(resolution);
+  const parked = pendingResolvers.get(approvalId);
+  if (!parked) return false;
+  parked.resolve(resolution);
   pendingResolvers.delete(approvalId);
   return true;
+}
+
+/**
+ * Turning unattended mode on has to catch up with whatever the agent is
+ * already blocked on: the tool call that made the user reach for the button is
+ * usually one of them, and leaving it parked would be the one request
+ * unattended mode failed to answer.
+ *
+ * Returns how many were released.
+ */
+export function autoAllowParkedApprovals(runId: number): number {
+  let released = 0;
+  for (const [approvalId, parked] of [...pendingResolvers]) {
+    if (parked.runId !== runId) continue;
+    if (resolvePendingApproval(approvalId, {
+      decision: "allow",
+      rememberScope: "once",
+      note: UNATTENDED_NOTE,
+    })) {
+      released++;
+    }
+  }
+  return released;
 }
 
 export interface CreateCanUseToolInput {
@@ -128,6 +160,28 @@ export function createLiveCanUseTool(input: CreateCanUseToolInput): CanUseTool {
     });
 
     appendRunLog(db, runId, "approval_request", request);
+
+    // Unattended mode answers before anyone is asked to. The request row is
+    // still written first, so the audit trail shows what was allowed and on
+    // whose behalf; no notification goes out, because not being interrupted is
+    // the entire point. An AskUserQuestion allowed this way carries no answers,
+    // which is the SDK's "you decide" — the agent picks for itself and keeps
+    // going, rather than being blocked on a person who has stepped away.
+    if (isRunUnattended(db, runId)) {
+      resolveApprovalRequest(db, request.id, "allowed", {
+        rememberScope: "once",
+        note: UNATTENDED_NOTE,
+      });
+      appendRunLog(db, runId, "approval_resolved", {
+        id: request.id,
+        decision: "allow",
+        rememberScope: "once",
+        note: UNATTENDED_NOTE,
+        unattended: true,
+      });
+      return allowWith(toolName, toolInput, null, localServiceHosts);
+    }
+
     // A question is worth reading in the notification itself: it's the one
     // "approval" whose whole content is the thing the user has to decide.
     const asked = toolName === ASK_USER_QUESTION ? firstQuestionText(toolInput) : null;
@@ -140,7 +194,7 @@ export function createLiveCanUseTool(input: CreateCanUseToolInput): CanUseTool {
     });
 
     const resolution = await new Promise<PendingResolution>((resolve) => {
-      pendingResolvers.set(request.id, resolve);
+      pendingResolvers.set(request.id, { runId, resolve });
 
       const timeout = setTimeout(() => {
         if (pendingResolvers.delete(request.id)) {
@@ -172,20 +226,33 @@ export function createLiveCanUseTool(input: CreateCanUseToolInput): CanUseTool {
     appendRunLog(db, runId, "approval_resolved", { id: request.id, ...resolution });
 
     if (resolution.decision === "allow") {
-      // The answers ride back on the tool's own input — that is how the SDK
-      // hands a choice to AskUserQuestion.
-      if (answers) {
-        return {
-          behavior: "allow",
-          updatedInput: { ...(toolInput as Record<string, unknown>), answers },
-        };
-      }
-      const updatedInput =
-        toolName === "Bash"
-          ? withLocalServiceProxyEnv(toolInput as Record<string, unknown>, localServiceHosts)
-          : undefined;
-      return updatedInput ? { behavior: "allow", updatedInput } : { behavior: "allow" };
+      return allowWith(toolName, toolInput, answers, localServiceHosts);
     }
     return { behavior: "deny", message: resolution.note ?? "Denied by user" };
   };
+}
+
+/**
+ * The one shape an allowed tool call comes back in, whoever allowed it.
+ * Answers ride back on the tool's own input — that is how the SDK hands a
+ * choice to AskUserQuestion — and a Bash command gets the same NO_PROXY
+ * narrowing the filter hook gives an auto-allowed one.
+ */
+function allowWith(
+  toolName: string,
+  toolInput: unknown,
+  answers: Record<string, string> | null,
+  localServiceHosts: string[]
+): { behavior: "allow"; updatedInput?: Record<string, unknown> } {
+  if (answers) {
+    return {
+      behavior: "allow",
+      updatedInput: { ...(toolInput as Record<string, unknown>), answers },
+    };
+  }
+  const updatedInput =
+    toolName === "Bash"
+      ? withLocalServiceProxyEnv(toolInput as Record<string, unknown>, localServiceHosts)
+      : undefined;
+  return updatedInput ? { behavior: "allow", updatedInput } : { behavior: "allow" };
 }

@@ -86,6 +86,12 @@ export interface RunRow {
   sdk_session_id: string | null;
   worktree_id: number | null;
   sandbox_config: string; // JSON
+  /**
+   * 1 auto-allows every tool call that reaches the human-in-the-loop "ask"
+   * path, so the run doesn't stop for anyone. Toggled from the UI at any point
+   * during the run — see the 009 migration and src/server/approvals.ts.
+   */
+  unattended: number;
   started_at: string | null;
   ended_at: string | null;
   error: string | null;
